@@ -35,6 +35,10 @@ function firstExistingPath(paths) {
 }
 
 function getBrowserExecutablePath() {
+  // Allow override for headless servers (e.g. Amazon Linux) where Chrome is in a custom path
+  const envPath = process.env.PUPPETEER_EXECUTABLE_PATH;
+  if (envPath && existsSync(envPath)) return envPath;
+
   const platform = process.platform;
 
   if (platform === 'darwin') {
@@ -63,15 +67,17 @@ function getBrowserExecutablePath() {
     ]);
   }
 
-  // linux + others
+  // linux + others (includes common paths on Amazon Linux, RHEL, Debian, etc.)
   return firstExistingPath([
     '/usr/bin/google-chrome',
     '/usr/bin/google-chrome-stable',
     '/usr/bin/chromium',
     '/usr/bin/chromium-browser',
+    '/usr/bin/chromium-browser-unstable',
     '/snap/bin/chromium',
     '/usr/bin/microsoft-edge',
     '/usr/bin/microsoft-edge-stable',
+    '/usr/lib64/chromium-browser/chromium-browser', // some Amazon Linux / RHEL
   ]);
 }
 
@@ -104,10 +110,17 @@ export async function getAuth() {
 
   let browser;
   try {
-    const args = ['--no-first-run', '--no-zygote', '--disable-blink-features=AutomationControlled'];
-    // Sandbox flags are mainly needed in Linux containers; keep them there.
+    const args = [
+      '--no-first-run',
+      '--no-zygote',
+      '--disable-blink-features=AutomationControlled',
+      '--disable-gpu',
+      '--disable-dev-shm-usage',
+      '--disable-software-rasterizer',
+      '--disable-extensions',
+    ];
     if (process.platform === 'linux') {
-      args.unshift('--no-sandbox', '--disable-setuid-sandbox');
+      args.push('--no-sandbox', '--disable-setuid-sandbox');
     }
 
     browser = await puppeteer.launch({
