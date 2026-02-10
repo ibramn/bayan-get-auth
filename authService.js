@@ -2,6 +2,9 @@ import puppeteer from 'puppeteer-core';
 import { existsSync } from 'fs';
 import { fetchOtpFromEmail } from './otpFetcher.js';
 
+const log = (...args) => console.log('[Auth]', ...args);
+const logStep = (step, detail = '') => console.log('[Auth]', `Step: ${step}`, detail ? `— ${detail}` : '');
+
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 let cachedAuth = null;
@@ -17,9 +20,12 @@ async function detectServerOops(page) {
 }
 
 async function throwIfServerOops(page, where) {
-  if (await detectServerOops(page)) {
+  const isOops = await detectServerOops(page);
+  if (isOops) {
+    logStep('Server OOPS detected', where);
     const screenshot = `bayan-server-oops-${Date.now()}.png`;
     await page.screenshot({ path: screenshot, fullPage: true }).catch(() => {});
+    console.log('[Auth] Screenshot saved:', screenshot);
     const err = new Error(`Bayan server error page at: ${where}`);
     err.debugScreenshot = screenshot;
     err.code = 'BAYAN_SERVER_OOPS';
@@ -29,15 +35,28 @@ async function throwIfServerOops(page, where) {
 
 function firstExistingPath(paths) {
   for (const p of paths) {
-    if (p && existsSync(p)) return p;
+    if (typeof p !== 'string' || !p.trim()) continue;
+    try {
+      if (existsSync(p)) return p;
+    } catch (_) {
+      // ignore permission/fs errors
+    }
   }
   return null;
 }
 
 function getBrowserExecutablePath() {
-  // Allow override for headless servers (e.g. Amazon Linux) where Chrome is in a custom path
-  const envPath = process.env.PUPPETEER_EXECUTABLE_PATH;
-  if (envPath && existsSync(envPath)) return envPath;
+  const envPath =
+    typeof process.env.PUPPETEER_EXECUTABLE_PATH === 'string'
+      ? process.env.PUPPETEER_EXECUTABLE_PATH.trim()
+      : '';
+  if (envPath) {
+    try {
+      if (existsSync(envPath)) return envPath;
+    } catch (_) {
+      // ignore fs errors
+    }
+  }
 
   const platform = process.platform;
 
@@ -86,27 +105,37 @@ function getBrowserExecutablePath() {
  * @returns {Promise<{ cookie: string, cookieHeader: string, accessToken: string | null, headers: object }>}
  */
 export async function getAuth() {
+  log('getAuth() started');
   const ttlMs = Number(process.env.AUTH_CACHE_TTL_MS || 0);
   if (ttlMs > 0 && cachedAuth && Date.now() - cachedAtMs < ttlMs) {
+    log('Using cached auth', { cacheAgeMs: Date.now() - cachedAtMs, ttlMs });
     return cachedAuth;
   }
+  logStep('Cache', ttlMs > 0 ? `TTL=${ttlMs}ms, cache miss` : 'caching disabled');
 
   const IDENTITY_NUMBER = process.env.BAYAN_IDENTITY_NUMBER;
   const PASSWORD = process.env.BAYAN_PASSWORD;
   const OTP_SENDER = process.env.BAYAN_OTP_SENDER || 'NoReply@logisti.sa';
   const OTP_WAIT_MS = Number(process.env.OTP_WAIT_MS || 10000);
   const MAX_ATTEMPTS = Number(process.env.LOGIN_MAX_ATTEMPTS || 3);
+  logStep('Config', `OTP_SENDER=${OTP_SENDER}, OTP_WAIT_MS=${OTP_WAIT_MS}, MAX_ATTEMPTS=${MAX_ATTEMPTS}, credentials=${IDENTITY_NUMBER ? 'set' : 'missing'}`);
 
   if (!IDENTITY_NUMBER || !PASSWORD) {
+    console.error('[Auth] Missing BAYAN_IDENTITY_NUMBER or BAYAN_PASSWORD');
     throw new Error('Missing BAYAN_IDENTITY_NUMBER or BAYAN_PASSWORD in environment');
   }
 
   const executablePath = getBrowserExecutablePath();
   if (!executablePath) {
+    console.error('[Auth] No Chrome/Chromium/Edge executable found');
     throw new Error(
       'Chrome/Chromium/Edge not found. Install a supported browser, or set PUPPETEER_EXECUTABLE_PATH and use it here.'
     );
   }
+  logStep('Browser', `executable=${executablePath}`);
+
+  const headless = process.env.HEADLESS !== 'false';
+  logStep('Launch', `headless=${headless}`);
 
   let browser;
   try {
@@ -124,8 +153,7 @@ export async function getAuth() {
     }
 
     browser = await puppeteer.launch({
-      // Default back to headless (set HEADLESS=false to see the browser)
-      headless: process.env.HEADLESS !== 'false',
+      headless,
       args,
       defaultViewport: null,
       ignoreHTTPSErrors: true,
@@ -133,13 +161,16 @@ export async function getAuth() {
       executablePath,
     });
   } catch (err) {
+    console.error('[Auth] Browser launch failed:', err.message);
     throw new Error('Failed to launch browser: ' + err.message);
   }
+  log('Browser launched successfully');
 
   try {
     let lastErr = null;
 
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      logStep(`Attempt ${attempt}/${MAX_ATTEMPTS}`, 'create context and page');
       const ctx = await browser.createBrowserContext();
       const page = await ctx.newPage();
 
@@ -166,14 +197,18 @@ export async function getAuth() {
       });
 
       try {
+        logStep('Navigate', 'bayan.logisti.sa');
         await page.goto('https://bayan.logisti.sa/', { waitUntil: 'networkidle2', timeout: 30000 });
+        logStep('Page load', 'waiting for app-root');
         await page.waitForSelector('app-root', { timeout: 15000 });
         await throwIfServerOops(page, 'landing');
 
         await delay(1500);
+        logStep('Landing', 'waiting for .card');
         await page.waitForSelector('.card', { visible: true, timeout: 15000 });
         await throwIfServerOops(page, 'landing cards');
 
+        logStep('Landing', 'click Local Carrier / first card');
         const clicked = await page.evaluate(() => {
           const titles = Array.from(document.querySelectorAll('h4.card-title'));
           const localCarrierTitle = titles.find((el) => el.textContent.trim() === 'Local Carrier');
@@ -193,36 +228,49 @@ export async function getAuth() {
         await delay(2500);
         await throwIfServerOops(page, 'after local carrier click');
 
+        logStep('Login form', 'waiting for #Username, #password');
         await page.waitForSelector('#Username', { visible: true, timeout: 20000 });
         await page.waitForSelector('#password', { visible: true, timeout: 20000 });
         await throwIfServerOops(page, 'login page');
 
+        logStep('Login form', 'filling credentials and Policy=Email');
         await page.type('#Username', IDENTITY_NUMBER, { delay: 80 });
         await page.type('#password', PASSWORD, { delay: 80 });
         await page.select('#Policy', 'Email');
         await delay(300);
 
-        // Capture baseline email ID BEFORE triggering OTP (so we can wait for a NEW email)
+        logStep('OTP baseline', 'getting latest message id before submit');
         let baselineOtpMsgId = null;
         try {
           const { getLatestMessageMeta } = await import('./otpFetcher.js');
           const meta = await getLatestMessageMeta(OTP_SENDER);
           baselineOtpMsgId = meta?.id ?? null;
-        } catch (_) {}
+          log('OTP baseline message id', baselineOtpMsgId ?? 'none');
+        } catch (e) {
+          log('OTP baseline fetch failed (will still try OTP)', e?.message);
+        }
 
+        logStep('Login', 'submit credentials');
         await page.click('button[type="submit"][value="login"]');
+        logStep('OTP page', 'waiting for #TwoFactorCode1');
         await page.waitForSelector('#TwoFactorCode1', { visible: true, timeout: 25000 });
         await throwIfServerOops(page, 'otp page');
 
-        // Give Bayan time to send OTP email
+        logStep('OTP', `waiting ${OTP_WAIT_MS}ms for email then fetching OTP`);
         await delay(OTP_WAIT_MS);
-        // Simple mode: always read the latest email from sender and extract OTP
-        // Wait for a NEW OTP email (by messageId) and then extract OTP from that newest message.
         const otp = await fetchOtpFromEmail(OTP_SENDER, 30, 2000, 0, baselineOtpMsgId);
-        if (!otp) throw new Error('Failed to fetch OTP from email');
+        if (!otp) {
+          console.error('[Auth] OTP fetch returned empty');
+          throw new Error('Failed to fetch OTP from email');
+        }
+        logStep('OTP', `received (length=${otp.length})`);
 
         const otpDigits = otp.split('');
-        if (otpDigits.length < 4) throw new Error(`OTP too short: ${otp}`);
+        if (otpDigits.length < 4) {
+          console.error('[Auth] OTP too short:', otp?.length);
+          throw new Error(`OTP too short: ${otp}`);
+        }
+        logStep('OTP', 'typing digits into TwoFactorCode1-4');
         for (let i = 0; i < 4; i++) {
           const fieldId = `#TwoFactorCode${i + 1}`;
           await page.click(fieldId);
@@ -234,6 +282,7 @@ export async function getAuth() {
         }
         await delay(300);
 
+        logStep('OTP', 'waiting for verify button enabled, then submit');
         await page.waitForFunction(
           () => {
             const btn = document.querySelector('button.verify-code');
@@ -243,14 +292,21 @@ export async function getAuth() {
         );
         await page.click('button.verify-code[type="submit"]');
 
-        // Wait until we are REALLY logged in (dashboard OR session cookies)
+        logStep('Post-login', 'waiting for dashboard/session (up to 60s)');
         const waitForPostLogin = async (timeoutMs = 60000) => {
           const start = Date.now();
           while (Date.now() - start < timeoutMs) {
             await throwIfServerOops(page, 'post-login wait');
-            const url = page.url();
-            const cookies = await page.cookies();
-            const names = new Set(cookies.map((c) => c.name));
+            let url = '';
+            let cookies = [];
+            try {
+              url = page.url();
+              cookies = await page.cookies();
+            } catch (e) {
+              await delay(750);
+              continue;
+            }
+            const names = new Set((cookies || []).map((c) => c?.name).filter(Boolean));
             const hasDashboard = (await page.$('.sidebar-menu').catch(() => null)) != null;
             const hasSessionCookie = names.has('JSESSIONID') || names.has('TS01f96da1') || names.has('lang');
             const stillOnLogin = url.includes('/login') || (url.includes('#') && url.toLowerCase().includes('login'));
@@ -260,30 +316,48 @@ export async function getAuth() {
           throw new Error('Post-login state not reached (still on login/OTP page)');
         };
         await waitForPostLogin(60000);
+        logStep('Post-login', 'reached');
 
         await delay(1500);
         await throwIfServerOops(page, 'after login');
 
-        const cookies = await page.cookies();
-        const cookieHeader = cookies.map((c) => `${c.name}=${c.value}`).join('; ');
+        logStep('Result', 'reading cookies and storage');
+        let cookies = [];
+        try {
+          cookies = await page.cookies();
+        } catch (e) {
+          console.error('[Auth] page.cookies() failed:', e?.message);
+          throw new Error('Failed to read cookies: ' + (e?.message ?? 'unknown'));
+        }
+        const cookieHeader = (cookies || []).map((c) => `${c?.name}=${c?.value}`).filter(Boolean).join('; ');
         const cookiesObj = {};
-        cookies.forEach((c) => {
-          cookiesObj[c.name] = c.value;
+        (cookies || []).forEach((c) => {
+          if (c?.name != null) cookiesObj[c.name] = c.value ?? '';
         });
 
-        const response = await page.evaluate(() => {
-          const localStorage = {};
-          const sessionStorage = {};
-          for (let i = 0; i < window.localStorage.length; i++) {
-            const key = window.localStorage.key(i);
-            localStorage[key] = window.localStorage.getItem(key);
-          }
-          for (let i = 0; i < window.sessionStorage.length; i++) {
-            const key = window.sessionStorage.key(i);
-            sessionStorage[key] = window.sessionStorage.getItem(key);
-          }
-          return { localStorage, sessionStorage };
-        });
+        let response = { localStorage: {}, sessionStorage: {} };
+        try {
+          response = await page.evaluate(() => {
+            const localStorage = {};
+            const sessionStorage = {};
+            try {
+              for (let i = 0; i < window.localStorage.length; i++) {
+                const key = window.localStorage.key(i);
+                localStorage[key] = window.localStorage.getItem(key);
+              }
+              for (let i = 0; i < window.sessionStorage.length; i++) {
+                const key = window.sessionStorage.key(i);
+                sessionStorage[key] = window.sessionStorage.getItem(key);
+              }
+            } catch (_) {}
+            return { localStorage, sessionStorage };
+          });
+        } catch (e) {
+          log('page.evaluate(storage) failed, continuing without storage:', e?.message);
+        }
+        if (!response || typeof response !== 'object') {
+          response = { localStorage: {}, sessionStorage: {} };
+        }
 
         // Same logic as getAuthHeaders.js (raw values)
         let accessToken = null;
@@ -302,11 +376,15 @@ export async function getAuth() {
         checkStorage(response.localStorage);
         if (!accessToken) checkStorage(response.sessionStorage);
         if (!accessToken && lastBearerToken) accessToken = lastBearerToken;
+        log('Token source', accessToken ? 'localStorage/sessionStorage or request' : 'none');
 
-        const userAgent = await page.evaluate(() => navigator.userAgent);
+        let userAgent = '';
+        try {
+          userAgent = await page.evaluate(() => navigator?.userAgent || '');
+        } catch (_) {}
         const headers = {
           Cookie: cookieHeader,
-          'User-Agent': userAgent,
+          'User-Agent': userAgent || 'Mozilla/5.0',
           Referer: 'https://bayan.logisti.sa/',
           Origin: 'https://bayan.logisti.sa',
         };
@@ -315,27 +393,35 @@ export async function getAuth() {
         await ctx.close().catch(() => {});
 
         const result = { cookie: cookiesObj, cookieHeader, accessToken, headers };
+        const cookieCount = Object.keys(cookiesObj).length;
+        logStep('Success', `cookies=${cookieCount}, accessToken=${accessToken ? 'yes' : 'no'}`);
         if (ttlMs > 0) {
           cachedAuth = result;
           cachedAtMs = Date.now();
+          log('Cached result', { ttlMs });
         }
         return result;
       } catch (e) {
         lastErr = e;
+        console.error('[Auth] Attempt failed:', e?.message, e?.code || '');
         await ctx.close().catch(() => {});
-        // Retry only on Bayan server error page (or first attempt generic flake)
         if (attempt < MAX_ATTEMPTS) {
-          await delay(1500 * attempt);
+          const backoff = 1500 * attempt;
+          logStep('Retry', `backoff ${backoff}ms before attempt ${attempt + 1}`);
+          await delay(backoff);
           continue;
         }
       }
     }
 
+    console.error('[Auth] All attempts exhausted');
     throw lastErr ?? new Error('Login failed');
   } catch (error) {
-    if (browser && browser.isConnected()) {
-      await browser.close().catch(() => {});
-    }
+    console.error('[Auth] getAuth failed:', error?.message);
     throw error;
+  } finally {
+    if (browser?.isConnected?.()) {
+      await browser.close().catch((e) => console.error('[Auth] browser.close error:', e?.message));
+    }
   }
 }

@@ -6,8 +6,9 @@ import { extractOtp } from './otpUtils.js';
 
 const DEBUG = process.env.DEBUG_OTP === 'true';
 const dlog = (...args) => {
-  if (DEBUG) console.log('[DEBUG_OTP]', ...args);
+  if (DEBUG) console.log('[OTP_DEBUG]', ...args);
 };
+const log = (...args) => console.log('[OTP]', ...args);
 
 const tenantId = process.env.AZURE_TENANT_ID;
 const clientId = process.env.AZURE_CLIENT_ID;
@@ -17,16 +18,31 @@ const userEmail = process.env.USER_EMAIL;
 let graphClient = null;
 
 function getGraphClient() {
-  if (graphClient) return graphClient;
-  if (!tenantId || !clientId || !clientSecret || !userEmail) {
+  if (graphClient) {
+    log('Graph client reused');
+    return graphClient;
+  }
+  log('Initializing Microsoft Graph client');
+  const t = typeof tenantId === 'string' ? tenantId.trim() : '';
+  const c = typeof clientId === 'string' ? clientId.trim() : '';
+  const s = typeof clientSecret === 'string' ? clientSecret.trim() : '';
+  const u = typeof userEmail === 'string' ? userEmail.trim() : '';
+  if (!t || !c || !s || !u) {
+    console.error('[OTP] Missing env: AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, USER_EMAIL');
     throw new Error('Missing: AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, USER_EMAIL');
   }
-  const credential = new ClientSecretCredential(tenantId, clientId, clientSecret);
-  const authProvider = new TokenCredentialAuthenticationProvider(credential, {
-    scopes: ['https://graph.microsoft.com/.default'],
-  });
-  graphClient = Client.initWithMiddleware({ authProvider });
-  return graphClient;
+  try {
+    const credential = new ClientSecretCredential(t, c, s);
+    const authProvider = new TokenCredentialAuthenticationProvider(credential, {
+      scopes: ['https://graph.microsoft.com/.default'],
+    });
+    graphClient = Client.initWithMiddleware({ authProvider });
+    log('Graph client ready', { userEmail: u });
+    return graphClient;
+  } catch (e) {
+    console.error('[OTP] Graph client init failed:', e?.message);
+    throw e;
+  }
 }
 
 function getFromAddress(msg) {
@@ -46,14 +62,21 @@ function matchSender(addr, wanted) {
 }
 
 async function fetchMessages(client, { folder, top = 25, filter, orderBy, select }) {
-  const path = folder
-    ? `/users/${userEmail}/mailFolders/${folder}/messages`
-    : `/users/${userEmail}/messages`;
-  let req = client.api(path).top(top).select(select);
-  if (filter) req = req.filter(filter);
-  if (orderBy) req = req.orderby(orderBy);
-  const res = await req.get();
-  return res?.value ?? [];
+  if (!client?.api) return [];
+  try {
+    const path = folder
+      ? `/users/${userEmail}/mailFolders/${folder}/messages`
+      : `/users/${userEmail}/messages`;
+    let req = client.api(path).top(Math.min(Number(top) || 25, 200)).select(select || 'id,subject,receivedDateTime,from,sender,bodyPreview');
+    if (filter) req = req.filter(filter);
+    if (orderBy) req = req.orderby(orderBy);
+    const res = await req.get();
+    const list = res?.value;
+    return Array.isArray(list) ? list : [];
+  } catch (e) {
+    log('fetchMessages failed', folder || 'messages', e?.message);
+    return [];
+  }
 }
 
 async function getLatestMessageFrom(fromAddress, client) {
@@ -98,22 +121,40 @@ async function getLatestMessageFrom(fromAddress, client) {
 }
 
 async function getMessageBodyById(messageId, client) {
-  return await client
-    .api(`/users/${userEmail}/messages/${messageId}`)
-    .select('id,subject,receivedDateTime,from,sender,body,bodyPreview')
-    .get();
+  if (!messageId || !client?.api) return null;
+  try {
+    return await client
+      .api(`/users/${userEmail}/messages/${messageId}`)
+      .select('id,subject,receivedDateTime,from,sender,body,bodyPreview')
+      .get();
+  } catch (e) {
+    log('getMessageBodyById failed', messageId, e?.message);
+    return null;
+  }
 }
 
 export async function getLatestMessageMeta(fromAddress = 'NoReply@logisti.sa') {
-  const client = getGraphClient();
-  const msg = await getLatestMessageFrom(fromAddress, client);
-  if (!msg) return null;
-  return {
-    id: msg.id,
-    from: getFromAddress(msg),
-    receivedDateTime: msg.receivedDateTime,
-    subject: msg.subject || '',
-  };
+  const from = typeof fromAddress === 'string' ? fromAddress.trim() : 'NoReply@logisti.sa';
+  log('getLatestMessageMeta', { fromAddress: from });
+  try {
+    const client = getGraphClient();
+    const msg = await getLatestMessageFrom(from, client);
+    if (!msg) {
+      log('getLatestMessageMeta: no message found');
+      return null;
+    }
+    const meta = {
+      id: msg.id,
+      from: getFromAddress(msg),
+      receivedDateTime: msg.receivedDateTime,
+      subject: (msg.subject || '').slice(0, 500),
+    };
+    log('getLatestMessageMeta: found', { id: meta.id, subject: meta.subject?.slice(0, 50) });
+    return meta;
+  } catch (e) {
+    console.error('[OTP] getLatestMessageMeta failed:', e?.message);
+    return null;
+  }
 }
 
 /**
@@ -127,14 +168,26 @@ export async function fetchOtpFromEmail(
   maxAgeMinutes = 2,
   afterMessageId = null
 ) {
-  const client = getGraphClient();
-  const maxAge = maxAgeMinutes * 60 * 1000;
+  const from = typeof fromAddress === 'string' ? fromAddress.trim() : 'NoReply@logisti.sa';
+  const maxRetries = Math.min(Math.max(1, Number(retries) || 5), 50);
+  const delay = Math.min(Math.max(500, Number(delayMs) || 2000), 60000);
+  const maxAgeMin = Number(maxAgeMinutes);
+  log('fetchOtpFromEmail started', { fromAddress: from, retries: maxRetries, delayMs: delay, maxAgeMinutes: maxAgeMin, afterMessageId: afterMessageId ?? 'none' });
+  let client;
+  try {
+    client = getGraphClient();
+  } catch (e) {
+    console.error('[OTP] fetchOtpFromEmail getGraphClient failed:', e?.message);
+    return null;
+  }
+  const maxAge = (Number.isFinite(maxAgeMin) && maxAgeMin > 0 ? maxAgeMin : 2) * 60 * 1000;
 
-  for (let attempt = 1; attempt <= retries; attempt++) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
       const startTime = Date.now();
-      dlog(`Attempt ${attempt}/${retries}…`);
-      const msg = await getLatestMessageFrom(fromAddress, client);
+      log('fetchOtpFromEmail attempt', `${attempt}/${maxRetries}`);
+      dlog(`Attempt ${attempt}/${maxRetries}…`);
+      const msg = await getLatestMessageFrom(from, client);
 
       if (msg) {
         if (afterMessageId && msg.id === afterMessageId) {
@@ -158,40 +211,47 @@ export async function fetchOtpFromEmail(
         const preview = msg.bodyPreview || '';
         dlog('Preview (first 200 chars):', preview.slice(0, 200).replace(/\s+/g, ' '));
         // If maxAgeMinutes <= 0, accept any age. Otherwise enforce it.
-        if (!Number.isFinite(maxAgeMinutes) || maxAgeMinutes <= 0 || age <= maxAge) {
-          // Try subject/preview first
+        if (!Number.isFinite(maxAgeMin) || maxAgeMin <= 0 || age <= maxAge) {
           let otp = extractOtp(subject) || extractOtp(preview);
           dlog('OTP from subject/preview:', otp);
 
-          // Fallback: fetch full body
-          // For DEBUG_OTP, always fetch body once so you can see content.
           if (!otp || DEBUG) {
             const full = await getMessageBodyById(msg.id, client);
             const bodyContent =
-              (full.body?.contentType === 'text' ? full.body?.content : '') ||
-              (full.body?.contentType === 'html' ? full.body?.content : '') ||
+              (full?.body?.contentType === 'text' ? full.body?.content : '') ||
+              (full?.body?.contentType === 'html' ? full.body?.content : '') ||
               '';
             if (DEBUG) {
-              dlog(`Body contentType=${full.body?.contentType} length=${bodyContent.length}`);
+              dlog(`Body contentType=${full?.body?.contentType} length=${bodyContent.length}`);
               dlog('Body snippet (first 400 chars):', bodyContent.slice(0, 400).replace(/\s+/g, ' '));
             }
             otp = otp || extractOtp(subject) || extractOtp(preview) || extractOtp(bodyContent);
             dlog('OTP after reading full body:', otp);
           }
 
-          if (otp) return otp;
+          if (otp) {
+            log('fetchOtpFromEmail success', { attempt, otpLength: otp.length });
+            return otp;
+          }
         } else {
-          dlog(`Message too old (>${maxAgeMinutes} min).`);
+          log('fetchOtpFromEmail message too old', { maxAgeMinutes: maxAgeMin });
+          dlog(`Message too old (>${maxAgeMin} min).`);
         }
       } else {
+        log('fetchOtpFromEmail no message from sender');
         dlog('No message matched the sender filter.');
       }
 
-      if (attempt < retries) await new Promise((r) => setTimeout(r, delayMs));
+      if (attempt < maxRetries) {
+        log('fetchOtpFromEmail retry in', delay, 'ms');
+        await new Promise((r) => setTimeout(r, delay));
+      }
     } catch (error) {
+      console.error('[OTP] fetchOtpFromEmail attempt failed:', error?.message || error);
       dlog('OTP fetch attempt failed:', error?.message || error);
-      if (attempt < retries) await new Promise((r) => setTimeout(r, delayMs));
+      if (attempt < maxRetries) await new Promise((r) => setTimeout(r, delay));
     }
   }
+  log('fetchOtpFromEmail exhausted retries, returning null');
   return null;
 }
