@@ -106,12 +106,37 @@ async function proxyToBayan(req, res) {
     return;
   }
 
+  const cookieHeader = auth?.cookieHeader || auth?.headers?.Cookie || auth?.headers?.cookie || '';
+  const hasBearer = Boolean(auth?.accessToken);
+  const cookieLen = typeof cookieHeader === 'string' ? cookieHeader.length : 0;
+  const cookieCount =
+    typeof cookieHeader === 'string' && cookieHeader
+      ? cookieHeader.split(';').filter((p) => p.includes('=')).length
+      : 0;
+  log('Bayan proxy auth ready', {
+    hasBearer,
+    cookieLen,
+    cookieCount,
+  });
+
   const headers = {
     'Accept-Language': 'en-US,en;q=0.9',
     ...(auth?.headers && typeof auth.headers === 'object' ? auth.headers : {}),
   };
-  if (auth?.cookieHeader) headers['Cookie'] = auth.cookieHeader;
+  if (cookieHeader) headers['Cookie'] = cookieHeader;
   if (auth?.accessToken) headers['Authorization'] = `Bearer ${auth.accessToken}`;
+  // Prefer incoming Accept (from .NET); otherwise set a permissive default.
+  headers['Accept'] = req.get('Accept') || headers['Accept'] || 'application/json, text/plain, */*';
+  // PDF endpoint often behaves better when Accept includes application/pdf.
+  if (pathAndQuery.includes('/print/') && !String(headers['Accept']).includes('application/pdf')) {
+    headers['Accept'] = `application/pdf, ${headers['Accept']}`;
+  }
+
+  log('Bayan proxy upstream headers', {
+    sendAuthorization: Boolean(headers['Authorization']),
+    sendCookie: Boolean(headers['Cookie']),
+    accept: headers['Accept'],
+  });
 
   const opts = {
     method: req.method,
