@@ -181,19 +181,34 @@ function getBrowserExecutablePath() {
 // Set AUTH_CACHE_TTL_MS=0 to disable fallback TTL usage entirely.
 const DEFAULT_AUTH_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
 
-export async function getAuth() {
+export async function invalidateAuthCache({ persist = true } = {}) {
+  cachedAuth = null;
+  cachedAtMs = 0;
+  try {
+    inFlightAuthPromise = null;
+  } catch (_) {}
+  if (persist) await persistAuthCache();
+}
+
+export async function getAuth(options = {}) {
   log('getAuth() started');
   await loadAuthCacheOnce();
 
+  const forceRefresh = options?.forceRefresh === true;
+  if (forceRefresh) {
+    log('Force refresh requested; invalidating cache');
+    await invalidateAuthCache({ persist: false });
+  }
+
   // Coalesce concurrent calls so only one login/OTP happens at a time.
-  if (inFlightAuthPromise) {
+  if (!forceRefresh && inFlightAuthPromise) {
     log('Awaiting in-flight auth refresh');
     return await inFlightAuthPromise;
   }
 
   const envTtl = process.env.AUTH_CACHE_TTL_MS;
   const ttlMs = envTtl === undefined || envTtl === '' ? DEFAULT_AUTH_CACHE_TTL_MS : Number(envTtl) || 0;
-  if (isCachedAuthValid({ ttlMs })) {
+  if (!forceRefresh && isCachedAuthValid({ ttlMs })) {
     log('Using cached auth', { cacheAgeMs: Date.now() - cachedAtMs, ttlMs });
     return cachedAuth;
   }

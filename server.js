@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import express from 'express';
-import { getAuth } from './authService.js';
+import { getAuth, invalidateAuthCache } from './authService.js';
 
 const log = (...args) => console.log('[Server]', ...args);
 
@@ -97,6 +97,54 @@ async function proxyToBayan(req, res) {
   const targetUrl = BAYAN_BASE_URL + pathAndQuery;
   log('Bayan proxy', req.method, pathAndQuery);
 
+  const doUpstream = async (auth, attemptLabel = 'initial') => {
+    const cookieHeader = auth?.cookieHeader || auth?.headers?.Cookie || auth?.headers?.cookie || '';
+    const hasBearer = Boolean(auth?.accessToken);
+    const cookieLen = typeof cookieHeader === 'string' ? cookieHeader.length : 0;
+    const cookieCount =
+      typeof cookieHeader === 'string' && cookieHeader
+        ? cookieHeader.split(';').filter((p) => p.includes('=')).length
+        : 0;
+    log('Bayan proxy auth ready', { attempt: attemptLabel, hasBearer, cookieLen, cookieCount });
+
+    const headers = {
+      'Accept-Language': 'en-US,en;q=0.9',
+      ...(auth?.headers && typeof auth.headers === 'object' ? auth.headers : {}),
+    };
+    if (cookieHeader) headers['Cookie'] = cookieHeader;
+    if (auth?.accessToken) headers['Authorization'] = `Bearer ${auth.accessToken}`;
+    headers['Accept'] = req.get('Accept') || headers['Accept'] || 'application/json, text/plain, */*';
+    if (pathAndQuery.includes('/print/') && !String(headers['Accept']).includes('application/pdf')) {
+      headers['Accept'] = `application/pdf, ${headers['Accept']}`;
+    }
+
+    log('Bayan proxy upstream headers', {
+      attempt: attemptLabel,
+      sendAuthorization: Boolean(headers['Authorization']),
+      sendCookie: Boolean(headers['Cookie']),
+      accept: headers['Accept'],
+    });
+
+    const opts = {
+      method: req.method,
+      headers,
+      signal: AbortSignal.timeout(BAYAN_PROXY_TIMEOUT_MS),
+    };
+    const hasBody = req.method !== 'GET' && req.method !== 'HEAD' && req.body !== undefined && req.body !== null;
+    if (hasBody) {
+      const contentType = req.get('Content-Type') || 'application/json';
+      headers['Content-Type'] = contentType;
+      opts.body = typeof req.body === 'string' ? req.body : JSON.stringify(req.body);
+    }
+    if (req.method === 'GET' && req.body !== undefined && req.body !== null && Object.keys(req.body || {}).length > 0) {
+      headers['Content-Type'] = 'application/json';
+      opts.body = JSON.stringify(req.body);
+    }
+
+    const upstream = await fetch(targetUrl, opts);
+    return upstream;
+  };
+
   let auth;
   try {
     auth = await getAuth();
@@ -106,60 +154,28 @@ async function proxyToBayan(req, res) {
     return;
   }
 
-  const cookieHeader = auth?.cookieHeader || auth?.headers?.Cookie || auth?.headers?.cookie || '';
-  const hasBearer = Boolean(auth?.accessToken);
-  const cookieLen = typeof cookieHeader === 'string' ? cookieHeader.length : 0;
-  const cookieCount =
-    typeof cookieHeader === 'string' && cookieHeader
-      ? cookieHeader.split(';').filter((p) => p.includes('=')).length
-      : 0;
-  log('Bayan proxy auth ready', {
-    hasBearer,
-    cookieLen,
-    cookieCount,
-  });
-
-  const headers = {
-    'Accept-Language': 'en-US,en;q=0.9',
-    ...(auth?.headers && typeof auth.headers === 'object' ? auth.headers : {}),
-  };
-  if (cookieHeader) headers['Cookie'] = cookieHeader;
-  if (auth?.accessToken) headers['Authorization'] = `Bearer ${auth.accessToken}`;
-  // Prefer incoming Accept (from .NET); otherwise set a permissive default.
-  headers['Accept'] = req.get('Accept') || headers['Accept'] || 'application/json, text/plain, */*';
-  // PDF endpoint often behaves better when Accept includes application/pdf.
-  if (pathAndQuery.includes('/print/') && !String(headers['Accept']).includes('application/pdf')) {
-    headers['Accept'] = `application/pdf, ${headers['Accept']}`;
-  }
-
-  log('Bayan proxy upstream headers', {
-    sendAuthorization: Boolean(headers['Authorization']),
-    sendCookie: Boolean(headers['Cookie']),
-    accept: headers['Accept'],
-  });
-
-  const opts = {
-    method: req.method,
-    headers,
-    signal: AbortSignal.timeout(BAYAN_PROXY_TIMEOUT_MS),
-  };
-  const hasBody = req.method !== 'GET' && req.method !== 'HEAD' && req.body !== undefined && req.body !== null;
-  if (hasBody) {
-    const contentType = req.get('Content-Type') || 'application/json';
-    headers['Content-Type'] = contentType;
-    opts.body = typeof req.body === 'string' ? req.body : JSON.stringify(req.body);
-  }
-  // GET with body (e.g. consignment_notes list filter) – some Bayan endpoints expect it
-  if (req.method === 'GET' && req.body !== undefined && req.body !== null && Object.keys(req.body || {}).length > 0) {
-    headers['Content-Type'] = 'application/json';
-    opts.body = JSON.stringify(req.body);
-  }
-
   try {
-    const upstream = await fetch(targetUrl, opts);
+    let upstream = await doUpstream(auth, 'initial');
     const contentType = upstream.headers.get('Content-Type') || '';
     const isJson = contentType.includes('application/json');
     const isBinary = contentType.includes('application/pdf') || contentType.includes('octet-stream');
+
+    // If Bayan rejects the session/token (often because cookies expire earlier than JWT),
+    // force refresh auth and retry once.
+    if ((upstream.status === 401 || upstream.status === 403) && !pathAndQuery.includes('/auth')) {
+      const text1 = await upstream.text().catch(() => '');
+      log('Bayan proxy upstream auth rejection', upstream.status, pathAndQuery, text1?.slice(0, 120));
+
+      try {
+        await invalidateAuthCache();
+        auth = await getAuth({ forceRefresh: true });
+        upstream = await doUpstream(auth, 'retry-refresh');
+      } catch (e) {
+        console.error('[Server] Bayan proxy refresh+retry failed:', e?.message);
+        res.status(502).json({ success: false, error: 'Auth refresh failed: ' + (e?.message ?? 'unknown') });
+        return;
+      }
+    }
 
     if (!upstream.ok) {
       const text = await upstream.text().catch(() => '');
