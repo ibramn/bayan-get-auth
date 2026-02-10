@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import express from 'express';
-import { getAuth, invalidateAuthCache } from './authService.js';
+import { getAuth } from './authService.js';
 
 const log = (...args) => console.log('[Server]', ...args);
 
@@ -93,9 +93,27 @@ app.all(['/bayan', '/bayan/*'], (req, res) => {
 });
 
 async function proxyToBayan(req, res) {
-  const pathAndQuery = req.originalUrl.replace(/^\/bayan/, '') || '/';
+  const rawPathAndQuery = req.originalUrl.replace(/^\/bayan/, '') || '/';
+
+  // Special-case: Bayan print endpoint expects POST with body { tripId: "..." } (not query param).
+  // If caller sends ?tripId=..., translate it to body and remove from upstream URL.
+  let pathAndQuery = rawPathAndQuery;
+  let bodyOverride = null;
+  try {
+    const u = new URL('http://local' + rawPathAndQuery);
+    if (u.pathname === '/api/consignment_notes/print/trip') {
+      const tripIdQ = u.searchParams.get('tripId');
+      if (tripIdQ) {
+        u.searchParams.delete('tripId');
+        pathAndQuery = u.pathname + (u.searchParams.toString() ? `?${u.searchParams.toString()}` : '');
+        const b = req.body && typeof req.body === 'object' ? req.body : {};
+        if (!b.tripId) bodyOverride = { tripId: String(tripIdQ) };
+      }
+    }
+  } catch (_) {}
+
   const targetUrl = BAYAN_BASE_URL + pathAndQuery;
-  log('Bayan proxy', req.method, pathAndQuery);
+  log('Bayan proxy', req.method, rawPathAndQuery, bodyOverride ? '(tripId from query → body)' : '');
 
   const doUpstream = async (auth, attemptLabel = 'initial') => {
     const cookieHeader = auth?.cookieHeader || auth?.headers?.Cookie || auth?.headers?.cookie || '';
@@ -140,6 +158,10 @@ async function proxyToBayan(req, res) {
       headers['Content-Type'] = 'application/json';
       opts.body = JSON.stringify(req.body);
     }
+    if (bodyOverride) {
+      headers['Content-Type'] = 'application/json';
+      opts.body = JSON.stringify(bodyOverride);
+    }
 
     const upstream = await fetch(targetUrl, opts);
     return upstream;
@@ -159,23 +181,6 @@ async function proxyToBayan(req, res) {
     const contentType = upstream.headers.get('Content-Type') || '';
     const isJson = contentType.includes('application/json');
     const isBinary = contentType.includes('application/pdf') || contentType.includes('octet-stream');
-
-    // If Bayan rejects the session/token (often because cookies expire earlier than JWT),
-    // force refresh auth and retry once.
-    if ((upstream.status === 401 || upstream.status === 403) && !pathAndQuery.includes('/auth')) {
-      const text1 = await upstream.text().catch(() => '');
-      log('Bayan proxy upstream auth rejection', upstream.status, pathAndQuery, text1?.slice(0, 120));
-
-      try {
-        await invalidateAuthCache();
-        auth = await getAuth({ forceRefresh: true });
-        upstream = await doUpstream(auth, 'retry-refresh');
-      } catch (e) {
-        console.error('[Server] Bayan proxy refresh+retry failed:', e?.message);
-        res.status(502).json({ success: false, error: 'Auth refresh failed: ' + (e?.message ?? 'unknown') });
-        return;
-      }
-    }
 
     if (!upstream.ok) {
       const text = await upstream.text().catch(() => '');
