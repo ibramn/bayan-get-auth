@@ -179,8 +179,18 @@ async function proxyToBayan(req, res) {
   try {
     let upstream = await doUpstream(auth, 'initial');
     const contentType = upstream.headers.get('Content-Type') || '';
+    const contentLengthHeader = upstream.headers.get('Content-Length') || '';
     const isJson = contentType.includes('application/json');
     const isBinary = contentType.includes('application/pdf') || contentType.includes('octet-stream');
+    const isPrintEndpoint =
+      pathAndQuery.startsWith('/api/consignment_notes/print/') || pathAndQuery.includes('/consignment_notes/print/');
+    log('Bayan proxy upstream meta', {
+      status: upstream.status,
+      contentType,
+      contentLength: contentLengthHeader,
+      isBinary,
+      isPrintEndpoint,
+    });
 
     if (!upstream.ok) {
       const text = await upstream.text().catch(() => '');
@@ -189,14 +199,20 @@ async function proxyToBayan(req, res) {
       return;
     }
 
-    if (upstream.status === 204 || upstream.headers.get('Content-Length') === '0') {
+    if (upstream.status === 204 || contentLengthHeader === '0') {
       res.status(204).end();
       return;
     }
 
-    if (isBinary) {
-      const buf = await upstream.arrayBuffer();
-      res.set('Content-Type', contentType).send(Buffer.from(buf));
+    // For print endpoints, always treat response as binary to avoid corrupting PDF by reading as text.
+    if (isBinary || isPrintEndpoint) {
+      const ab = await upstream.arrayBuffer();
+      const out = Buffer.from(ab);
+      const cd = upstream.headers.get('Content-Disposition');
+      const ct = contentType || 'application/pdf';
+      log('Bayan proxy PDF bytes', { bytes: out.length, contentType: ct, contentDisposition: cd || '' });
+      if (cd) res.set('Content-Disposition', cd);
+      res.status(upstream.status).set('Content-Type', ct).send(out);
       return;
     }
     const text = await upstream.text();
