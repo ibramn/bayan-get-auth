@@ -5,6 +5,8 @@ import { getAuth } from './authService.js';
 const log = (...args) => console.log('[Server]', ...args);
 
 const AUTH_REQUEST_TIMEOUT_MS = Number(process.env.AUTH_REQUEST_TIMEOUT_MS || 0) || 180000; // 3 min default
+const BAYAN_BASE_URL = (process.env.BAYAN_BASE_URL || 'https://bayan.logisti.sa').replace(/\/$/, '');
+const BAYAN_PROXY_TIMEOUT_MS = Number(process.env.BAYAN_PROXY_TIMEOUT_MS || 0) || 120000; // 2 min default
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -82,10 +84,99 @@ app.get('/health', (req, res) => {
   res.json({ ok: true });
 });
 
+/**
+ * Proxy all Bayan API calls through this app so .NET (and others) never call bayan.logisti.sa directly.
+ * Request to /bayan/api/... → get auth, then forward to BAYAN_BASE_URL/api/... with Cookie + Bearer.
+ */
+app.all(['/bayan', '/bayan/*'], (req, res) => {
+  proxyToBayan(req, res);
+});
+
+async function proxyToBayan(req, res) {
+  const pathAndQuery = req.originalUrl.replace(/^\/bayan/, '') || '/';
+  const targetUrl = BAYAN_BASE_URL + pathAndQuery;
+  log('Bayan proxy', req.method, pathAndQuery);
+
+  let auth;
+  try {
+    auth = await getAuth();
+  } catch (e) {
+    console.error('[Server] Bayan proxy getAuth failed:', e?.message);
+    res.status(502).json({ success: false, error: 'Auth failed: ' + (e?.message ?? 'unknown') });
+    return;
+  }
+
+  const headers = {
+    'Accept-Language': 'en-US,en;q=0.9',
+    ...(auth?.headers && typeof auth.headers === 'object' ? auth.headers : {}),
+  };
+  if (auth?.cookieHeader) headers['Cookie'] = auth.cookieHeader;
+  if (auth?.accessToken) headers['Authorization'] = `Bearer ${auth.accessToken}`;
+
+  const opts = {
+    method: req.method,
+    headers,
+    signal: AbortSignal.timeout(BAYAN_PROXY_TIMEOUT_MS),
+  };
+  const hasBody = req.method !== 'GET' && req.method !== 'HEAD' && req.body !== undefined && req.body !== null;
+  if (hasBody) {
+    const contentType = req.get('Content-Type') || 'application/json';
+    headers['Content-Type'] = contentType;
+    opts.body = typeof req.body === 'string' ? req.body : JSON.stringify(req.body);
+  }
+  // GET with body (e.g. consignment_notes list filter) – some Bayan endpoints expect it
+  if (req.method === 'GET' && req.body !== undefined && req.body !== null && Object.keys(req.body || {}).length > 0) {
+    headers['Content-Type'] = 'application/json';
+    opts.body = JSON.stringify(req.body);
+  }
+
+  try {
+    const upstream = await fetch(targetUrl, opts);
+    const contentType = upstream.headers.get('Content-Type') || '';
+    const isJson = contentType.includes('application/json');
+    const isBinary = contentType.includes('application/pdf') || contentType.includes('octet-stream');
+
+    if (!upstream.ok) {
+      const text = await upstream.text().catch(() => '');
+      log('Bayan proxy upstream error', upstream.status, pathAndQuery, text?.slice(0, 200));
+      res.status(upstream.status).set('Content-Type', contentType || 'text/plain').send(text || upstream.statusText);
+      return;
+    }
+
+    if (upstream.status === 204 || upstream.headers.get('Content-Length') === '0') {
+      res.status(204).end();
+      return;
+    }
+
+    if (isBinary) {
+      const buf = await upstream.arrayBuffer();
+      res.set('Content-Type', contentType).send(Buffer.from(buf));
+      return;
+    }
+    const text = await upstream.text();
+    if (isJson) {
+      try {
+        res.set('Content-Type', contentType).json(JSON.parse(text));
+      } catch (_) {
+        res.set('Content-Type', contentType).send(text);
+      }
+    } else {
+      res.set('Content-Type', contentType || 'text/plain').send(text);
+    }
+  } catch (e) {
+    if (e.name === 'TimeoutError') {
+      res.status(504).json({ success: false, error: 'Bayan proxy timed out' });
+      return;
+    }
+    console.error('[Server] Bayan proxy fetch failed:', e?.message);
+    res.status(502).json({ success: false, error: 'Upstream request failed: ' + (e?.message ?? 'unknown') });
+  }
+}
+
 const server = app.listen(PORT, () => {
   log('Listening', `http://localhost:${PORT}`);
-  log('Endpoints', `GET or POST ${PORT}/auth → cookie + accessToken`, 'GET /health → ok');
-  log('Auth timeout', `${AUTH_REQUEST_TIMEOUT_MS}ms`);
+  log('Endpoints', `GET or POST ${PORT}/auth → cookie + accessToken`, 'GET /health → ok', `GET/POST ${PORT}/bayan/* → proxy to Bayan`);
+  log('Auth timeout', `${AUTH_REQUEST_TIMEOUT_MS}ms`, 'Bayan base', BAYAN_BASE_URL);
 });
 
 function shutdown(signal) {
