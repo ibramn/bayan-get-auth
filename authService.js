@@ -45,11 +45,12 @@ function tryGetJwtExpMs(token) {
 
 function isCachedAuthValid({ ttlMs, skewMs = 60_000 } = {}) {
   if (!cachedAuth) return false;
-  // Prefer JWT exp when available: refresh only when token is really expired (with small safety skew).
+  // When JWT exp is available, also honor TTL since cookies/WAF tokens may expire earlier than JWT.
   const expMs = tryGetJwtExpMs(cachedAuth.accessToken);
   if (expMs) {
-    const ok = Date.now() < expMs - skewMs;
-    return ok;
+    const okJwt = Date.now() < expMs - skewMs;
+    const okTtl = ttlMs > 0 && cachedAtMs > 0 ? Date.now() - cachedAtMs < ttlMs : true;
+    return okJwt && okTtl;
   }
   if (ttlMs > 0 && cachedAtMs > 0) return Date.now() - cachedAtMs < ttlMs;
   return false;

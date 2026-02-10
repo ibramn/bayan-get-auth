@@ -178,6 +178,7 @@ async function proxyToBayan(req, res) {
 
   try {
     let upstream = await doUpstream(auth, 'initial');
+    const initialStatus = upstream.status;
     const contentType = upstream.headers.get('Content-Type') || '';
     const contentLengthHeader = upstream.headers.get('Content-Length') || '';
     const isJson = contentType.includes('application/json');
@@ -191,6 +192,22 @@ async function proxyToBayan(req, res) {
       isBinary,
       isPrintEndpoint,
     });
+
+    // If Bayan returns 401/403, our cached cookies/session may be invalid even if JWT exp hasn't passed.
+    // For print endpoints this happens frequently (WAF/session binding). Force refresh auth and retry once.
+    if ((upstream.status === 401 || upstream.status === 403) && isPrintEndpoint) {
+      log('Bayan proxy upstream auth error; forcing auth refresh and retry', {
+        status: upstream.status,
+        pathAndQuery,
+      });
+      try {
+        const freshAuth = await getAuth({ forceRefresh: true });
+        upstream = await doUpstream(freshAuth, 'forceRefresh');
+      } catch (e) {
+        console.error('[Server] Bayan proxy forceRefresh failed:', e?.message);
+        // Continue with original upstream result handling below.
+      }
+    }
 
     if (!upstream.ok) {
       const text = await upstream.text().catch(() => '');
