@@ -1,5 +1,6 @@
 import puppeteer from 'puppeteer-core';
 import { existsSync } from 'fs';
+import { readFile, writeFile } from 'fs/promises';
 import { fetchOtpFromEmail } from './otpFetcher.js';
 
 const log = (...args) => console.log('[Auth]', ...args);
@@ -9,6 +10,78 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 let cachedAuth = null;
 let cachedAtMs = 0;
+let cacheLoaded = false;
+let inFlightAuthPromise = null;
+
+const AUTH_CACHE_FILE =
+  (process.env.AUTH_CACHE_FILE && String(process.env.AUTH_CACHE_FILE).trim()) ||
+  '/tmp/bayan-auth-cache.json';
+
+function base64UrlDecodeToString(s) {
+  try {
+    const pad = '='.repeat((4 - (s.length % 4)) % 4);
+    const b64 = (s + pad).replace(/-/g, '+').replace(/_/g, '/');
+    return Buffer.from(b64, 'base64').toString('utf8');
+  } catch (_) {
+    return '';
+  }
+}
+
+function tryGetJwtExpMs(token) {
+  if (typeof token !== 'string') return null;
+  const parts = token.split('.');
+  if (parts.length < 2) return null;
+  const payloadStr = base64UrlDecodeToString(parts[1]);
+  if (!payloadStr) return null;
+  try {
+    const payload = JSON.parse(payloadStr);
+    const exp = payload?.exp;
+    if (!Number.isFinite(exp)) return null;
+    return Number(exp) * 1000;
+  } catch (_) {
+    return null;
+  }
+}
+
+function isCachedAuthValid({ ttlMs, skewMs = 60_000 } = {}) {
+  if (!cachedAuth) return false;
+  // Prefer JWT exp when available: refresh only when token is really expired (with small safety skew).
+  const expMs = tryGetJwtExpMs(cachedAuth.accessToken);
+  if (expMs) {
+    const ok = Date.now() < expMs - skewMs;
+    return ok;
+  }
+  if (ttlMs > 0 && cachedAtMs > 0) return Date.now() - cachedAtMs < ttlMs;
+  return false;
+}
+
+async function loadAuthCacheOnce() {
+  if (cacheLoaded) return;
+  cacheLoaded = true;
+  try {
+    const raw = await readFile(AUTH_CACHE_FILE, 'utf8');
+    const obj = JSON.parse(raw);
+    if (obj && typeof obj === 'object') {
+      cachedAuth = obj.cachedAuth ?? null;
+      cachedAtMs = Number(obj.cachedAtMs) || 0;
+      if (cachedAuth) log('Loaded auth cache from disk', { file: AUTH_CACHE_FILE, cachedAtMs });
+    }
+  } catch (_) {
+    // ignore (file missing/corrupt)
+  }
+}
+
+async function persistAuthCache() {
+  try {
+    await writeFile(
+      AUTH_CACHE_FILE,
+      JSON.stringify({ cachedAtMs, cachedAuth }, null, 2),
+      'utf8'
+    );
+  } catch (e) {
+    console.error('[Auth] Failed to persist auth cache:', e?.message);
+  }
+}
 
 async function detectServerOops(page) {
   try {
@@ -104,18 +177,29 @@ function getBrowserExecutablePath() {
  * Login to bayan.logisti.sa and return cookie and access token.
  * @returns {Promise<{ cookie: string, cookieHeader: string, accessToken: string | null, headers: object }>}
  */
-// Default 5 min cache so proxy (/bayan/*) and repeated /auth calls don't do full login every time. Set AUTH_CACHE_TTL_MS=0 to disable.
-const DEFAULT_AUTH_CACHE_TTL_MS = 5 * 60 * 1000;
+// Fallback TTL for non-JWT tokens/cookies. If accessToken is a JWT, we prefer its exp time.
+// Set AUTH_CACHE_TTL_MS=0 to disable fallback TTL usage entirely.
+const DEFAULT_AUTH_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
 
 export async function getAuth() {
   log('getAuth() started');
+  await loadAuthCacheOnce();
+
+  // Coalesce concurrent calls so only one login/OTP happens at a time.
+  if (inFlightAuthPromise) {
+    log('Awaiting in-flight auth refresh');
+    return await inFlightAuthPromise;
+  }
+
   const envTtl = process.env.AUTH_CACHE_TTL_MS;
   const ttlMs = envTtl === undefined || envTtl === '' ? DEFAULT_AUTH_CACHE_TTL_MS : Number(envTtl) || 0;
-  if (ttlMs > 0 && cachedAuth && Date.now() - cachedAtMs < ttlMs) {
+  if (isCachedAuthValid({ ttlMs })) {
     log('Using cached auth', { cacheAgeMs: Date.now() - cachedAtMs, ttlMs });
     return cachedAuth;
   }
   logStep('Cache', ttlMs > 0 ? `TTL=${ttlMs}ms, cache miss` : 'caching disabled');
+
+  inFlightAuthPromise = (async () => {
 
   const IDENTITY_NUMBER = process.env.BAYAN_IDENTITY_NUMBER;
   const PASSWORD = process.env.BAYAN_PASSWORD;
@@ -399,10 +483,11 @@ export async function getAuth() {
         const result = { cookie: cookiesObj, cookieHeader, accessToken, headers };
         const cookieCount = Object.keys(cookiesObj).length;
         logStep('Success', `cookies=${cookieCount}, accessToken=${accessToken ? 'yes' : 'no'}`);
-        if (ttlMs > 0) {
+        if (ttlMs > 0 || tryGetJwtExpMs(result?.accessToken)) {
           cachedAuth = result;
           cachedAtMs = Date.now();
           log('Cached result', { ttlMs });
+          await persistAuthCache();
         }
         return result;
       } catch (e) {
@@ -427,5 +512,12 @@ export async function getAuth() {
     if (browser?.isConnected?.()) {
       await browser.close().catch((e) => console.error('[Auth] browser.close error:', e?.message));
     }
+  }
+  })();
+
+  try {
+    return await inFlightAuthPromise;
+  } finally {
+    inFlightAuthPromise = null;
   }
 }
