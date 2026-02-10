@@ -104,9 +104,13 @@ function getBrowserExecutablePath() {
  * Login to bayan.logisti.sa and return cookie and access token.
  * @returns {Promise<{ cookie: string, cookieHeader: string, accessToken: string | null, headers: object }>}
  */
+// Default 5 min cache so proxy (/bayan/*) and repeated /auth calls don't do full login every time. Set AUTH_CACHE_TTL_MS=0 to disable.
+const DEFAULT_AUTH_CACHE_TTL_MS = 5 * 60 * 1000;
+
 export async function getAuth() {
   log('getAuth() started');
-  const ttlMs = Number(process.env.AUTH_CACHE_TTL_MS || 0);
+  const envTtl = process.env.AUTH_CACHE_TTL_MS;
+  const ttlMs = envTtl === undefined || envTtl === '' ? DEFAULT_AUTH_CACHE_TTL_MS : Number(envTtl) || 0;
   if (ttlMs > 0 && cachedAuth && Date.now() - cachedAtMs < ttlMs) {
     log('Using cached auth', { cacheAgeMs: Date.now() - cachedAtMs, ttlMs });
     return cachedAuth;
