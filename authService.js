@@ -252,9 +252,9 @@ export async function getAuth(options = {}) {
       '--disable-software-rasterizer',
       '--disable-extensions',
     ];
-    if (process.platform === 'linux') {
-      args.push('--no-sandbox', '--disable-setuid-sandbox');
-    }
+    // if (process.platform === 'linux') {
+    //   args.push('--no-sandbox', '--disable-setuid-sandbox');
+    // }
 
     browser = await puppeteer.launch({
       headless,
