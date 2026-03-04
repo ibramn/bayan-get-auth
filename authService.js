@@ -1,5 +1,5 @@
 import puppeteer from 'puppeteer-core';
-import { existsSync } from 'fs';
+import { existsSync, mkdirSync } from 'fs';
 import { readFile, writeFile } from 'fs/promises';
 import { fetchOtpFromEmail } from './otpFetcher.js';
 
@@ -117,6 +117,32 @@ function firstExistingPath(paths) {
     }
   }
   return null;
+}
+
+function isRootUser() {
+  try {
+    return typeof process.getuid === 'function' && process.getuid() === 0;
+  } catch (_) {
+    return false;
+  }
+}
+
+function ensureLinuxRootRuntimeDir() {
+  // Chromium (when run as root) may try to create XDG_RUNTIME_DIR at /run/user/0.
+  // In some minimal/container environments /run/user can be read-only/unavailable.
+  if (process.platform !== 'linux') return;
+  if (!isRootUser()) return;
+
+  const current = (process.env.XDG_RUNTIME_DIR || '').trim();
+  if (current && current !== '/run/user/0') return;
+
+  const fallback = '/tmp/xdg-runtime-root';
+  try {
+    mkdirSync(fallback, { recursive: true, mode: 0o700 });
+  } catch (_) {
+    // ignore; we'll still set env and let Chromium try
+  }
+  process.env.XDG_RUNTIME_DIR = fallback;
 }
 
 function getBrowserExecutablePath() {
@@ -243,18 +269,22 @@ export async function getAuth(options = {}) {
 
   let browser;
   try {
+    ensureLinuxRootRuntimeDir();
+
     const args = [
       '--no-first-run',
-      '--no-zygote',
       '--disable-blink-features=AutomationControlled',
       '--disable-gpu',
       '--disable-dev-shm-usage',
       '--disable-software-rasterizer',
       '--disable-extensions',
     ];
-    // if (process.platform === 'linux') {
-    //   args.push('--no-sandbox', '--disable-setuid-sandbox');
-    // }
+
+    // Root on Linux cannot use Chromium sandbox; keep args consistent.
+    // If we disable zygote, Chromium requires sandbox be disabled too.
+    if (process.platform === 'linux' && isRootUser()) {
+      args.push('--no-sandbox', '--disable-setuid-sandbox', '--no-zygote');
+    }
 
     browser = await puppeteer.launch({
       headless,
