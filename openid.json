@@ -1,0 +1,174 @@
+{
+    "issuer": "https://iam.logisti.sa",
+    "jwks_uri": "https://iam.logisti.sa/.well-known/openid-configuration/jwks",
+    "authorization_endpoint": "https://iam.logisti.sa/connect/authorize",
+    "token_endpoint": "https://iam.logisti.sa/connect/token",
+    "userinfo_endpoint": "https://iam.logisti.sa/connect/userinfo",
+    "end_session_endpoint": "https://iam.logisti.sa/connect/endsession",
+    "check_session_iframe": "https://iam.logisti.sa/connect/checksession",
+    "revocation_endpoint": "https://iam.logisti.sa/connect/revocation",
+    "introspection_endpoint": "https://iam.logisti.sa/connect/introspect",
+    "device_authorization_endpoint": "https://iam.logisti.sa/connect/deviceauthorization",
+    "backchannel_authentication_endpoint": "https://iam.logisti.sa/connect/ciba",
+    "pushed_authorization_request_endpoint": "https://iam.logisti.sa/connect/par",
+    "require_pushed_authorization_requests": false,
+    "frontchannel_logout_supported": true,
+    "frontchannel_logout_session_supported": true,
+    "backchannel_logout_supported": true,
+    "backchannel_logout_session_supported": true,
+    "scopes_supported": [
+        "roles",
+        "openid",
+        "profile",
+        "email",
+        "address",
+        "role",
+        "IdentityAdmin_api",
+        "skoruba_identity_admin_api",
+        "FirstName",
+        "offline_access"
+    ],
+    "claims_supported": [
+        "role",
+        "sub",
+        "DateOfBirth",
+        "phone_number_verified",
+        "IdentityNumber",
+        "FamilyNameEn",
+        "locale",
+        "zoneinfo",
+        "birthdate",
+        "gender",
+        "website",
+        "picture",
+        "preferred_username",
+        "nickname",
+        "middle_name",
+        "given_name",
+        "IdExpireDate",
+        "NationalityId",
+        "profile",
+        "updated_at",
+        "FirstNameAr",
+        "FatherNameAr",
+        "GrandFatherNameAr",
+        "FamilyNameAr",
+        "FirstNameEn",
+        "FatherNameEn",
+        "GrandFatherNameEn",
+        "name",
+        "family_name",
+        "phone_number",
+        "NationalityType",
+        "FullNameAr",
+        "FullNameEn",
+        "TermsAccepted",
+        "Email",
+        "IsForeign",
+        "PassportExpireDate",
+        "NationalityCode",
+        "email_verified",
+        "email",
+        "address",
+        "openid",
+        "FirstName",
+        "IdentityNo"
+    ],
+    "grant_types_supported": [
+        "authorization_code",
+        "client_credentials",
+        "refresh_token",
+        "implicit",
+        "password",
+        "urn:ietf:params:oauth:grant-type:device_code",
+        "urn:openid:params:grant-type:ciba",
+        "delegation"
+    ],
+    "response_types_supported": [
+        "code",
+        "token",
+        "id_token",
+        "id_token token",
+        "code id_token",
+        "code token",
+        "code id_token token"
+    ],
+    "response_modes_supported": [
+        "form_post",
+        "query",
+        "fragment"
+    ],
+    "token_endpoint_auth_methods_supported": [
+        "client_secret_basic",
+        "client_secret_post"
+    ],
+    "revocation_endpoint_auth_methods_supported": [
+        "client_secret_basic",
+        "client_secret_post"
+    ],
+    "introspection_endpoint_auth_methods_supported": [
+        "client_secret_basic",
+        "client_secret_post"
+    ],
+    "id_token_signing_alg_values_supported": [
+        "RS256"
+    ],
+    "userinfo_signing_alg_values_supported": [
+        "RS256"
+    ],
+    "introspection_signing_alg_values_supported": [
+        "RS256"
+    ],
+    "subject_types_supported": [
+        "public"
+    ],
+    "code_challenge_methods_supported": [
+        "plain",
+        "S256"
+    ],
+    "request_parameter_supported": true,
+    "request_object_signing_alg_values_supported": [
+        "RS256",
+        "RS384",
+        "RS512",
+        "PS256",
+        "PS384",
+        "PS512",
+        "ES256",
+        "ES384",
+        "ES512"
+    ],
+    "prompt_values_supported": [
+        "none",
+        "login",
+        "consent",
+        "select_account"
+    ],
+    "authorization_response_iss_parameter_supported": true,
+    "backchannel_token_delivery_modes_supported": [
+        "poll"
+    ],
+    "backchannel_user_code_parameter_supported": true,
+    "backchannel_authentication_request_signing_alg_values_supported": [
+        "RS256",
+        "RS384",
+        "RS512",
+        "PS256",
+        "PS384",
+        "PS512",
+        "ES256",
+        "ES384",
+        "ES512"
+    ],
+    "dpop_signing_alg_values_supported": [
+        "RS256",
+        "RS384",
+        "RS512",
+        "PS256",
+        "PS384",
+        "PS512",
+        "ES256",
+        "ES384",
+        "ES512"
+    ]
+}

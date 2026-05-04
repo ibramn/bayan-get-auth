@@ -79,38 +79,56 @@ async function fetchMessages(client, { folder, top = 25, filter, orderBy, select
   }
 }
 
+/**
+ * Newest-first messages from `fromAddress` merged across Inbox + Junk (same sender can
+ * appear in both; Inbox-only "latest" used to hide a newer Junk OTP).
+ */
+async function getRecentMessagesFromSender(fromAddress, client, topPerFolder = 80, maxMerged = 40) {
+  const wanted = (fromAddress || '').trim().toLowerCase();
+  const selectFields = 'id,subject,receivedDateTime,from,sender,bodyPreview';
+  const orderBy = 'receivedDateTime desc';
+  const folders = ['inbox', 'junkemail'];
+
+  const lists = await Promise.all(
+    folders.map((folder) =>
+      fetchMessages(client, { folder, top: topPerFolder, filter: null, orderBy, select: selectFields })
+    )
+  );
+
+  const seen = new Set();
+  const merged = [];
+  for (const list of lists) {
+    for (const m of list) {
+      if (!m?.id || seen.has(m.id)) continue;
+      if (!matchSender(getFromAddress(m), wanted)) continue;
+      seen.add(m.id);
+      merged.push(m);
+    }
+  }
+  merged.sort((a, b) => new Date(b.receivedDateTime) - new Date(a.receivedDateTime));
+  dlog('merged inbox+junk from sender', { count: merged.length, wanted });
+  return merged.slice(0, maxMerged);
+}
+
 async function getLatestMessageFrom(fromAddress, client) {
   const wanted = (fromAddress || '').trim().toLowerCase();
-  // NOTE: We do NOT rely on Graph's server-side "from =" filter because it can be brittle
-  // (aliases/casing/display differences). We fetch newest emails and match locally.
   try {
     dlog('USER_EMAIL (mailbox being read):', userEmail);
     dlog('Sender requested:', fromAddress);
 
+    const merged = await getRecentMessagesFromSender(fromAddress, client, 100, 50);
+    if (merged.length) return merged[0];
+
     const selectFields = 'id,subject,receivedDateTime,from,sender,bodyPreview';
     const orderBy = 'receivedDateTime desc';
-
-    // Prefer Inbox, then Junk, then All. Always match locally (case-insensitive).
-    const pickLatestMatch = (msgs, label) => {
-      const match = msgs.find((m) => matchSender(getFromAddress(m), wanted));
-      dlog(`${label} checked=${msgs.length} matched=${match ? 1 : 0}`);
-      return match ?? null;
-    };
-
-    const inbox = await fetchMessages(client, { folder: 'inbox', top: 100, filter: null, orderBy, select: selectFields });
-    const inboxMatch = pickLatestMatch(inbox, 'Inbox');
-    if (inboxMatch) return inboxMatch;
-
-    const junk = await fetchMessages(client, { folder: 'junkemail', top: 100, filter: null, orderBy, select: selectFields });
-    const junkMatch = pickLatestMatch(junk, 'JunkEmail');
-    if (junkMatch) return junkMatch;
-
     const all = await fetchMessages(client, { folder: null, top: 200, filter: null, orderBy, select: selectFields });
-    const allMatch = pickLatestMatch(all, 'All');
+    const allMatch =
+      all.filter((m) => matchSender(getFromAddress(m), wanted)).sort(
+        (a, b) => new Date(b.receivedDateTime) - new Date(a.receivedDateTime)
+      )[0] ?? null;
     return allMatch;
   } catch (e) {
     const msg = e?.message ?? '';
-    // Orderby can fail on some tenants. Fallback: fetch without orderby and sort locally.
     if (!msg.includes('restriction or sort order is too complex')) throw e;
     dlog('Graph complained about sort/filter complexity; fetching without orderby and sorting locally.');
     const selectFields = 'id,subject,receivedDateTime,from,sender,bodyPreview';
@@ -187,59 +205,93 @@ export async function fetchOtpFromEmail(
       const startTime = Date.now();
       log('fetchOtpFromEmail attempt', `${attempt}/${maxRetries}`);
       dlog(`Attempt ${attempt}/${maxRetries}…`);
-      const msg = await getLatestMessageFrom(from, client);
+      const messages = await getRecentMessagesFromSender(from, client, 100, 40);
 
-      if (msg) {
-        if (afterMessageId && msg.id === afterMessageId) {
-          dlog('Latest message is still the baseline id; waiting for a newer email…', { afterMessageId });
-          if (attempt < retries) await new Promise((r) => setTimeout(r, delayMs));
-          continue;
-        }
-
-        const from =
-          (msg.from?.emailAddress?.address || msg.sender?.emailAddress?.address || '').trim();
-        const msgTime = new Date(msg.receivedDateTime).getTime();
-        const age = startTime - msgTime;
-        dlog('Latest matched message:', {
-          id: msg.id,
-          from,
-          receivedDateTime: msg.receivedDateTime,
-          ageSeconds: Math.round(age / 1000),
-          subject: msg.subject || '',
-        });
-        const subject = msg.subject || '';
-        const preview = msg.bodyPreview || '';
-        dlog('Preview (first 200 chars):', preview.slice(0, 200).replace(/\s+/g, ' '));
-        // If maxAgeMinutes <= 0, accept any age. Otherwise enforce it.
-        if (!Number.isFinite(maxAgeMin) || maxAgeMin <= 0 || age <= maxAge) {
-          let otp = extractOtp(subject) || extractOtp(preview);
-          dlog('OTP from subject/preview:', otp);
-
-          if (!otp || DEBUG) {
-            const full = await getMessageBodyById(msg.id, client);
-            const bodyContent =
-              (full?.body?.contentType === 'text' ? full.body?.content : '') ||
-              (full?.body?.contentType === 'html' ? full.body?.content : '') ||
-              '';
-            if (DEBUG) {
-              dlog(`Body contentType=${full?.body?.contentType} length=${bodyContent.length}`);
-              dlog('Body snippet (first 400 chars):', bodyContent.slice(0, 400).replace(/\s+/g, ' '));
+      if (!messages.length) {
+        log('fetchOtpFromEmail no message from sender (inbox+junk)');
+        dlog('No message matched the sender filter.');
+        if (attempt === maxRetries || attempt % 5 === 0) {
+          try {
+            const peek = await Promise.all(
+              ['inbox', 'junkemail'].map((folder) =>
+                fetchMessages(client, {
+                  folder,
+                  top: 5,
+                  filter: null,
+                  orderBy: 'receivedDateTime desc',
+                  select: 'id,subject,receivedDateTime,from,sender',
+                }).then((list) => ({ folder, list }))
+              )
+            );
+            for (const { folder, list } of peek) {
+              const summary = (list || []).map((m) => ({
+                from: getFromAddress(m),
+                subject: (m.subject || '').slice(0, 80),
+                received: m.receivedDateTime,
+              }));
+              log(`fetchOtpFromEmail peek ${folder} latest 5:`, JSON.stringify(summary));
             }
-            otp = otp || extractOtp(subject) || extractOtp(preview) || extractOtp(bodyContent);
-            dlog('OTP after reading full body:', otp);
+          } catch (e) {
+            log('fetchOtpFromEmail peek failed:', e?.message);
           }
-
-          if (otp) {
-            log('fetchOtpFromEmail success', { attempt, otpLength: otp.length });
-            return otp;
-          }
-        } else {
-          log('fetchOtpFromEmail message too old', { maxAgeMinutes: maxAgeMin });
-          dlog(`Message too old (>${maxAgeMin} min).`);
         }
       } else {
-        log('fetchOtpFromEmail no message from sender');
-        dlog('No message matched the sender filter.');
+        const onlyBaseline =
+          afterMessageId && messages.length === 1 && messages[0].id === afterMessageId;
+        if (onlyBaseline) {
+          dlog('Only message is still the baseline id; waiting for a newer email…', { afterMessageId });
+        } else {
+          for (const msg of messages) {
+            if (afterMessageId && msg.id === afterMessageId) continue;
+
+            const fromAddr =
+              (msg.from?.emailAddress?.address || msg.sender?.emailAddress?.address || '').trim();
+            const msgTime = new Date(msg.receivedDateTime).getTime();
+            const age = startTime - msgTime;
+            dlog('Candidate message:', {
+              id: msg.id,
+              from: fromAddr,
+              receivedDateTime: msg.receivedDateTime,
+              ageSeconds: Math.round(age / 1000),
+              subject: (msg.subject || '').slice(0, 120),
+            });
+
+            if (Number.isFinite(maxAgeMin) && maxAgeMin > 0 && age > maxAge) {
+              dlog(`Skip message too old (>${maxAgeMin} min).`);
+              continue;
+            }
+
+            const subject = msg.subject || '';
+            const preview = msg.bodyPreview || '';
+            dlog('Preview (first 200 chars):', preview.slice(0, 200).replace(/\s+/g, ' '));
+
+            let otp = extractOtp(subject) || extractOtp(preview);
+            dlog('OTP from subject/preview:', otp);
+
+            if (!otp || DEBUG) {
+              const full = await getMessageBodyById(msg.id, client);
+              const bodyContent =
+                (full?.body?.contentType === 'text' ? full.body?.content : '') ||
+                (full?.body?.contentType === 'html' ? full.body?.content : '') ||
+                '';
+              if (DEBUG) {
+                dlog(`Body contentType=${full?.body?.contentType} length=${bodyContent.length}`);
+                dlog('Body snippet (first 400 chars):', bodyContent.slice(0, 400).replace(/\s+/g, ' '));
+              }
+              otp = otp || extractOtp(subject) || extractOtp(preview) || extractOtp(bodyContent);
+              dlog('OTP after reading full body:', otp);
+            }
+
+            if (otp) {
+              log('fetchOtpFromEmail success', {
+                attempt,
+                messageId: msg.id,
+                otpLength: otp.length,
+              });
+              return otp;
+            }
+          }
+        }
       }
 
       if (attempt < maxRetries) {

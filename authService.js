@@ -107,6 +107,393 @@ async function throwIfServerOops(page, where) {
   }
 }
 
+/** True if element exists and is shown (not display:none on self). */
+async function isElementDisplayed(page, selector) {
+  return page.evaluate((sel) => {
+    const el = document.querySelector(sel);
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+  }, selector);
+}
+
+async function dismissRememberedAccountsIfPresent(page) {
+  const accountsPhase = '#phase-accounts';
+  if (!(await isElementDisplayed(page, accountsPhase))) return;
+  logStep('IAM', 'remembered accounts list visible — use another account');
+  const useAnother = await page.$('#useAnotherAccount');
+  if (useAnother) await useAnother.click().catch(() => {});
+  await delay(500);
+}
+
+/** IAM (iam.logisti.sa) phased login after Bayan redirects to SSO. */
+async function completeIamProgressiveLogin(page, { IDENTITY_NUMBER, PASSWORD, OTP_SENDER }) {
+  await dismissRememberedAccountsIfPresent(page);
+
+  logStep('IAM', 'identifier — #Username, #continueBtn');
+  await page.waitForSelector('#Username', { visible: true, timeout: 25000 });
+  await throwIfServerOops(page, 'IAM identifier');
+  await page.click('#Username', { clickCount: 3 }).catch(() => {});
+  await page.type('#Username', IDENTITY_NUMBER, { delay: 80 });
+  await delay(200);
+  await page.click('#continueBtn');
+  await delay(800);
+
+  const pickPasswordFromMethods = () =>
+    page.evaluate(() => {
+      const grid = document.getElementById('methods-grid');
+      if (!grid) return false;
+      const candidates = Array.from(grid.querySelectorAll('button, [role="button"], a.btn'));
+      const isPasskeyish = (t) =>
+        /passkey|webauthn|fingerprint|face\s*id|بصمة|مفتاح\s*المرور|الوجه/i.test(t);
+      for (const el of candidates) {
+        const t = (el.textContent || '').toLowerCase();
+        if (isPasskeyish(t)) continue;
+        if (t.includes('password') || t.includes('كلمة') || t.includes('مرور')) {
+          el.click();
+          return true;
+        }
+      }
+      const nonPk = candidates.find((el) => !isPasskeyish((el.textContent || '').toLowerCase()));
+      if (nonPk) {
+        nonPk.click();
+        return true;
+      }
+      return false;
+    });
+
+  const PASSWORD_PHASE_DEADLINE_MS = Number(process.env.IAM_PASSWORD_PHASE_DEADLINE_MS || 60000);
+  const phaseDeadline = Date.now() + PASSWORD_PHASE_DEADLINE_MS;
+  let lastObservedPhase = '';
+  while (Date.now() < phaseDeadline) {
+    if (await isElementDisplayed(page, '#password')) break;
+    await throwIfServerOops(page, 'IAM phases');
+
+    if (await isElementDisplayed(page, '#phase-passkey')) {
+      if (lastObservedPhase !== 'passkey') {
+        logStep('IAM', 'passkey prompt — #passkeyTryAnother');
+        lastObservedPhase = 'passkey';
+      }
+      await page.click('#passkeyTryAnother').catch(() => {});
+      await delay(1200);
+      continue;
+    }
+
+    if (await isElementDisplayed(page, '#phase-methods')) {
+      if (lastObservedPhase !== 'methods') {
+        logStep('IAM', 'method grid — choose password');
+        lastObservedPhase = 'methods';
+      }
+      await pickPasswordFromMethods().catch(() => {});
+      await delay(1200);
+      continue;
+    }
+
+    if (lastObservedPhase !== 'waiting') {
+      logStep('IAM', 'no recognized phase visible — waiting for password/passkey/methods');
+      lastObservedPhase = 'waiting';
+    }
+    await delay(750);
+  }
+
+  if (!(await isElementDisplayed(page, '#password'))) {
+    const screenshot = `bayan-iam-no-password-${Date.now()}.png`;
+    await page.screenshot({ path: screenshot, fullPage: true }).catch(() => {});
+    const debugInfo = await page
+      .evaluate(() => {
+        const phases = ['phase-accounts', 'phase-passkey', 'phase-methods', 'phase-otp', 'phase-password'];
+        const visible = phases.filter((id) => {
+          const el = document.getElementById(id);
+          if (!el) return false;
+          const s = window.getComputedStyle(el);
+          return s.display !== 'none' && s.visibility !== 'hidden';
+        });
+        const url = window.location.href;
+        const title = document.title;
+        const bodyText = (document.body?.innerText || '').slice(0, 500);
+        return { url, title, visiblePhases: visible, bodyText };
+      })
+      .catch(() => null);
+    log('Password phase never appeared. Debug:', JSON.stringify(debugInfo));
+    log('Screenshot:', screenshot);
+    throw new Error('IAM password phase never appeared (#password not visible)');
+  }
+
+  logStep('IAM', 'password phase — #password, Policy Email, #passwordSubmitBtn');
+  await throwIfServerOops(page, 'IAM password');
+  await page.click('#password', { clickCount: 3 }).catch(() => {});
+  await page.type('#password', PASSWORD, { delay: 80 });
+  const emailPolicy = await page.$('input[name="Policy"][value="Email"]');
+  if (emailPolicy) {
+    await emailPolicy.click().catch(() => {});
+  }
+  await delay(300);
+
+  let baselineOtpMsgId = null;
+  try {
+    const { getLatestMessageMeta } = await import('./otpFetcher.js');
+    const meta = await getLatestMessageMeta(OTP_SENDER);
+    baselineOtpMsgId = meta?.id ?? null;
+    log('OTP baseline message id (before password submit)', baselineOtpMsgId ?? 'none');
+  } catch (e) {
+    log('OTP baseline fetch failed (will still try OTP)', e?.message);
+  }
+
+  logStep('IAM', 'submit password');
+  await page.click('#passwordSubmitBtn');
+  await delay(800);
+
+  logStep('IAM', 'wait for inline OTP (#phase-otp) or standalone /Account/VerifyOtp');
+  await page.waitForFunction(
+    () => {
+      const path = (window.location.pathname || '').toLowerCase();
+      if (path.includes('verifyotp')) return true;
+      const form = document.getElementById('formId');
+      const act = (form?.getAttribute('action') || '').toLowerCase();
+      if (act.includes('verifyotp')) return true;
+      const tfc = document.getElementById('TwoFactorCode1');
+      if (tfc) {
+        const st = window.getComputedStyle(tfc);
+        if (st.display !== 'none' && st.visibility !== 'hidden') return true;
+      }
+      const phase = document.getElementById('phase-otp');
+      if (!phase || window.getComputedStyle(phase).display === 'none') return false;
+      const send = document.getElementById('otp-send-step');
+      const verify = document.getElementById('otp-verify-step');
+      const sendOn = send && window.getComputedStyle(send).display !== 'none';
+      const verifyOn = verify && window.getComputedStyle(verify).display !== 'none';
+      return sendOn || verifyOn;
+    },
+    { timeout: 45000 }
+  );
+  await throwIfServerOops(page, 'IAM OTP');
+
+  const standaloneVerify = await page.evaluate(() => {
+    const path = (window.location.pathname || '').toLowerCase();
+    if (path.includes('verifyotp')) return true;
+    const form = document.getElementById('formId');
+    const act = form?.getAttribute('action') || '';
+    return act.includes('VerifyOtp');
+  });
+
+  if (standaloneVerify) {
+    logStep('IAM', 'standalone VerifyOtp — inputs ready (no #phase-otp send step)');
+    await page.waitForSelector('#TwoFactorCode1', { visible: true, timeout: 20000 });
+    await page
+      .waitForFunction(() => typeof window.jQuery === 'function', { timeout: 15000 })
+      .catch(() => null);
+  } else {
+    const sendStepVisible = await page.evaluate(() => {
+      const el = document.getElementById('otp-send-step');
+      return el && window.getComputedStyle(el).display !== 'none';
+    });
+    if (sendStepVisible) {
+      logStep('IAM', 'OTP send step — #otpSendBtn');
+      await page.click('#otpSendBtn');
+      const afterSendMs = Number(process.env.OTP_AFTER_SEND_MS || 4000);
+      await delay(Number.isFinite(afterSendMs) && afterSendMs >= 0 ? afterSendMs : 4000);
+    }
+
+    await page.waitForFunction(
+      () => {
+        const step = document.getElementById('otp-verify-step');
+        return step && window.getComputedStyle(step).display !== 'none';
+      },
+      { timeout: 25000 }
+    );
+  }
+
+  logStep('IAM', 'OTP inputs ready (.otp-input / TwoFactorCode*)');
+  await page.waitForSelector('#TwoFactorCode1, .otp-input', { visible: true, timeout: 15000 });
+
+  return { baselineOtpMsgId };
+}
+
+async function typeIamOtpAndVerify(page, otp) {
+  const digits = String(otp || '').replace(/\D/g, '').slice(0, 4);
+  if (digits.length < 4) throw new Error(`OTP too short: ${otp}`);
+
+  await page.waitForSelector('#TwoFactorCode1, .otp-input', { visible: true, timeout: 20000 });
+
+  logStep('IAM', 'OTP entry (jQuery .val + trigger input — matches otp-code.js)');
+  const jqFill = await page.evaluate((digs) => {
+    const $w = window.jQuery || window.$;
+    if (typeof $w !== 'function') return { ok: false, reason: 'no-jquery' };
+    digs.split('').forEach((digit, i) => {
+      const $el = $w(`.otp-input[data-index="${i + 1}"]`);
+      if ($el.length) $el.val(digit).trigger('input');
+    });
+    return { ok: true };
+  }, digits);
+
+  let filledOk = jqFill?.ok === true;
+  if (!filledOk) {
+    logStep('IAM', 'jQuery missing — Puppeteer keyboard per #TwoFactorCodeN');
+    for (let i = 0; i < 4; i++) {
+      const sel = `#TwoFactorCode${i + 1}`;
+      const h = await page.$(sel);
+      if (!h) throw new Error(`Missing ${sel}`);
+      await h.click({ clickCount: 3 });
+      await page.keyboard.press('Backspace').catch(() => {});
+      await page.keyboard.type(digits[i], { delay: 60 });
+      await delay(80);
+    }
+    filledOk = true;
+  }
+
+  const valuesOk = await page.evaluate(() =>
+    [1, 2, 3, 4].every((n) => {
+      const el = document.getElementById(`TwoFactorCode${n}`);
+      return el && String(el.value || '').length === 1;
+    })
+  );
+  if (!valuesOk) {
+    logStep('IAM', 'OTP cells incomplete — paste-style fill');
+    await page.evaluate((digs) => {
+      const $w = window.jQuery || window.$;
+      if (typeof $w === 'function') {
+        digs.split('').forEach((digit, i) => {
+          const $el = $w(`.otp-input[data-index="${i + 1}"]`);
+          if ($el.length) $el.val(digit).trigger('input');
+        });
+        return;
+      }
+      digs.split('').forEach((digit, i) => {
+        const el = document.getElementById(`TwoFactorCode${i + 1}`);
+        if (el) {
+          el.value = digit;
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+      });
+    }, digits);
+  }
+
+  await delay(400);
+
+  logStep('IAM', 'OTP verify button (VerifyOtp form or inline IAM)');
+  await page.waitForFunction(
+    () => {
+      const primary = document.querySelector(
+        'button[type="submit"][name="button"][value="verify"]:not(#fakeSubmitBtnExecuteOnEnter)'
+      );
+      if (primary && !primary.disabled) {
+        const r = primary.getBoundingClientRect();
+        if (r.width > 4 && r.height > 4) return true;
+      }
+      const a = document.getElementById('otpVerifyBtn');
+      if (a && !a.disabled) return true;
+      const b = document.querySelector('button.verify-code[type="submit"]');
+      return b && !b.disabled;
+    },
+    { timeout: 20000 }
+  );
+
+  const clicked = await page.evaluate(() => {
+    const primary = document.querySelector(
+      'button[type="submit"][name="button"][value="verify"]:not(#fakeSubmitBtnExecuteOnEnter)'
+    );
+    if (primary && !primary.disabled) {
+      const r = primary.getBoundingClientRect();
+      if (r.width > 4 && r.height > 4) {
+        primary.click();
+        return 'verify-submit-primary';
+      }
+    }
+    const a = document.getElementById('otpVerifyBtn');
+    if (a && !a.disabled) {
+      a.click();
+      return 'otpVerifyBtn';
+    }
+    const b = document.querySelector('button.verify-code[type="submit"]');
+    if (b && !b.disabled) {
+      b.click();
+      return 'verify-code';
+    }
+    return '';
+  });
+  if (!clicked) throw new Error('No enabled OTP verify button found');
+}
+
+async function waitForOtpResendEnabled(page, timeoutMs) {
+  logStep('IAM', 'waiting for resend (#otpResendBtn or #btnResendSms) to enable');
+  await page.waitForFunction(
+    () => {
+      const a = document.getElementById('otpResendBtn');
+      if (a && !a.disabled) return true;
+      const b = document.getElementById('btnResendSms');
+      if (!b || b.disabled) return false;
+      if (b.hasAttribute('hidden')) return false;
+      return true;
+    },
+    { timeout: timeoutMs }
+  );
+}
+
+async function fetchOtpWithResendFallback(page, params) {
+  const {
+    OTP_SENDER,
+    baselineOtpMsgId,
+    OTP_WAIT_MS,
+    OTP_RESEND_MAX,
+    OTP_RESEND_ENABLE_TIMEOUT_MS,
+    OTP_WAIT_AFTER_RESEND_MS,
+    OTP_FETCH_RETRIES,
+    OTP_FETCH_DELAY_MS,
+  } = params;
+
+  let baseline = baselineOtpMsgId;
+  logStep('OTP', `waiting ${OTP_WAIT_MS}ms on 2FA page before polling mail`);
+  await delay(OTP_WAIT_MS);
+
+  let otp = await fetchOtpFromEmail(
+    OTP_SENDER,
+    OTP_FETCH_RETRIES,
+    OTP_FETCH_DELAY_MS,
+    0,
+    baseline
+  );
+
+  const maxResend = Math.min(Math.max(0, OTP_RESEND_MAX), 5);
+  for (let round = 0; !otp && round < maxResend; round++) {
+    logStep('OTP', `no OTP from mail — IAM resend (${round + 1}/${maxResend})`);
+    try {
+      await waitForOtpResendEnabled(page, OTP_RESEND_ENABLE_TIMEOUT_MS);
+    } catch (e) {
+      log('Resend button did not become enabled in time:', e?.message || e);
+      break;
+    }
+    try {
+      const { getLatestMessageMeta } = await import('./otpFetcher.js');
+      const meta = await getLatestMessageMeta(OTP_SENDER);
+      if (meta?.id) baseline = meta.id;
+    } catch (e) {
+      log('getLatestMessageMeta before resend failed:', e?.message);
+    }
+    await page
+      .evaluate(() => {
+        const a = document.getElementById('otpResendBtn');
+        if (a && !a.disabled) {
+          a.click();
+          return;
+        }
+        const b = document.getElementById('btnResendSms');
+        if (b && !b.disabled && !b.hasAttribute('hidden')) b.click();
+      })
+      .catch((e) => log('resend click failed:', e?.message));
+    logStep('OTP', `waiting ${OTP_WAIT_AFTER_RESEND_MS}ms after resend before polling again`);
+    await delay(OTP_WAIT_AFTER_RESEND_MS);
+    otp = await fetchOtpFromEmail(
+      OTP_SENDER,
+      OTP_FETCH_RETRIES,
+      OTP_FETCH_DELAY_MS,
+      0,
+      baseline
+    );
+  }
+
+  return otp;
+}
+
 function firstExistingPath(paths) {
   for (const p of paths) {
     if (typeof p !== 'string' || !p.trim()) continue;
@@ -246,9 +633,22 @@ export async function getAuth(options = {}) {
   const IDENTITY_NUMBER = process.env.BAYAN_IDENTITY_NUMBER;
   const PASSWORD = process.env.BAYAN_PASSWORD;
   const OTP_SENDER = process.env.BAYAN_OTP_SENDER || 'NoReply@logisti.sa';
-  const OTP_WAIT_MS = Number(process.env.OTP_WAIT_MS || 10000);
+  const OTP_WAIT_MS = Number(process.env.OTP_WAIT_MS || 25000);
+  const OTP_AFTER_SEND_MS = Number(process.env.OTP_AFTER_SEND_MS || 4000);
+  const rawResend = process.env.OTP_RESEND_MAX;
+  const OTP_RESEND_MAX =
+    rawResend === undefined || rawResend === ''
+      ? 2
+      : Math.min(5, Math.max(0, Number(rawResend) || 0));
+  const OTP_RESEND_ENABLE_TIMEOUT_MS = Number(process.env.OTP_RESEND_ENABLE_TIMEOUT_MS || 120000);
+  const OTP_WAIT_AFTER_RESEND_MS = Number(process.env.OTP_WAIT_AFTER_RESEND_MS || 8000);
+  const OTP_FETCH_RETRIES = Number(process.env.OTP_FETCH_RETRIES || 35);
+  const OTP_FETCH_DELAY_MS = Number(process.env.OTP_FETCH_DELAY_MS || 2000);
   const MAX_ATTEMPTS = Number(process.env.LOGIN_MAX_ATTEMPTS || 3);
-  logStep('Config', `OTP_SENDER=${OTP_SENDER}, OTP_WAIT_MS=${OTP_WAIT_MS}, MAX_ATTEMPTS=${MAX_ATTEMPTS}, credentials=${IDENTITY_NUMBER ? 'set' : 'missing'}`);
+  logStep(
+    'Config',
+    `OTP_SENDER=${OTP_SENDER}, OTP_WAIT_MS=${OTP_WAIT_MS}, OTP_AFTER_SEND_MS=${OTP_AFTER_SEND_MS}, OTP_RESEND_MAX=${OTP_RESEND_MAX}, OTP_FETCH_RETRIES=${OTP_FETCH_RETRIES}, MAX_ATTEMPTS=${MAX_ATTEMPTS}, credentials=${IDENTITY_NUMBER ? 'set' : 'missing'}`
+  );
 
   if (!IDENTITY_NUMBER || !PASSWORD) {
     console.error('[Auth] Missing BAYAN_IDENTITY_NUMBER or BAYAN_PASSWORD');
@@ -318,12 +718,79 @@ export async function getAuth(options = {}) {
       }
 
       let lastBearerToken = null;
-      page.on('request', (req) => {
+      page.on('request', async (req) => {
         try {
           const h = req.headers?.() ?? {};
           const auth = h.authorization || h.Authorization;
           if (typeof auth === 'string' && auth.toLowerCase().startsWith('bearer ')) {
             lastBearerToken = auth.slice('bearer '.length).trim();
+          }
+
+          const url = req.url() || '';
+          if (url.includes('/connect/authorize')) {
+            try {
+              const u = new URL(url);
+              const p = Object.fromEntries(u.searchParams.entries());
+              console.log('[OIDC sniff] /connect/authorize', JSON.stringify({
+                client_id: p.client_id,
+                response_type: p.response_type,
+                response_mode: p.response_mode,
+                scope: p.scope,
+                redirect_uri: p.redirect_uri,
+                code_challenge_method: p.code_challenge_method,
+                acr_values: p.acr_values,
+                prompt: p.prompt,
+              }));
+            } catch (_) {}
+          }
+          if (url.includes('/connect/token')) {
+            try {
+              const post = (await req.fetchPostData()) || '';
+              const p = Object.fromEntries(new URLSearchParams(post).entries());
+              const r = { ...p };
+              if (r.password) r.password = '***';
+              if (r.code) r.code = '***';
+              if (r.code_verifier) r.code_verifier = '***';
+              if (r.client_secret) r.client_secret = '***';
+              if (r.refresh_token) r.refresh_token = '***';
+              console.log('[OIDC sniff] /connect/token request', JSON.stringify(r));
+            } catch (_) {}
+          }
+        } catch (_) {
+          // ignore
+        }
+      });
+
+      let pendingReloadReason = null;
+      page.on('requestfailed', (req) => {
+        try {
+          if (req.resourceType?.() !== 'document') return;
+          const url = req.url() || '';
+          if (!/bayan\.logisti\.sa/.test(url)) return;
+          const failure = req.failure?.();
+          const errText = failure?.errorText || 'unknown';
+          console.log('[Auth] [requestfailed]', errText, url.slice(0, 200));
+          pendingReloadReason = errText;
+        } catch (_) {}
+      });
+
+      page.on('response', async (res) => {
+        try {
+          const url = res.url() || '';
+          if (!url.includes('/connect/token')) return;
+          const status = res.status();
+          let body = '';
+          try { body = await res.text(); } catch (_) {}
+          let parsed = null;
+          try { parsed = JSON.parse(body); } catch (_) {}
+          if (parsed && typeof parsed === 'object') {
+            const r = { ...parsed };
+            if (r.access_token) r.access_token = `<jwt:len=${String(r.access_token).length}>`;
+            if (r.id_token) r.id_token = `<jwt:len=${String(r.id_token).length}>`;
+            if (r.refresh_token) r.refresh_token = '***';
+            console.log('[OIDC sniff] /connect/token response', status, JSON.stringify(r));
+          } else {
+            console.log('[OIDC sniff] /connect/token response', status, body.slice(0, 300));
           }
         } catch (_) {
           // ignore
@@ -333,123 +800,161 @@ export async function getAuth(options = {}) {
       try {
         logStep('Navigate', 'bayan.logisti.sa');
         await page.goto('https://bayan.logisti.sa/', { waitUntil: 'networkidle2', timeout: 30000 });
-        logStep('Page load', 'waiting for app-root');
-        await page.waitForSelector('app-root', { timeout: 15000 });
+        logStep('Page load', 'waiting for Bayan app-root or IAM login');
+        await page.waitForFunction(
+          () => document.querySelector('app-root') || document.querySelector('#Username'),
+          { timeout: 20000 }
+        );
         await throwIfServerOops(page, 'landing');
 
         await delay(1500);
-        logStep('Landing', 'waiting for .card');
-        await page.waitForSelector('.card', { visible: true, timeout: 15000 });
+        logStep('Landing', 'waiting for Bayan role cards or IAM #Username');
+        await page.waitForFunction(
+          () => document.querySelector('.card') || document.querySelector('#Username'),
+          { timeout: 20000 }
+        );
         await throwIfServerOops(page, 'landing cards');
 
-        logStep('Landing', 'click Local Carrier / first card');
-        const clicked = await page.evaluate(() => {
-          const titles = Array.from(document.querySelectorAll('h4.card-title'));
-          const localCarrierTitle = titles.find((el) => el.textContent.trim() === 'Local Carrier');
-          if (localCarrierTitle) {
-            const card = localCarrierTitle.closest('.card');
-            if (card) {
-              card.click();
-              return true;
+        const urlAfterLoad = page.url();
+        if (!urlAfterLoad.includes('iam.logisti.sa')) {
+          logStep('Landing', 'click Local Carrier / first card');
+          const clicked = await page.evaluate(() => {
+            const titles = Array.from(document.querySelectorAll('h4.card-title'));
+            const localCarrierTitle = titles.find((el) => el.textContent.trim() === 'Local Carrier');
+            if (localCarrierTitle) {
+              const card = localCarrierTitle.closest('.card');
+              if (card) {
+                card.click();
+                return true;
+              }
             }
+            return false;
+          });
+          if (!clicked) {
+            const hasCard = await page.$('.column:first-child .card');
+            if (hasCard) await page.click('.column:first-child .card');
           }
-          return false;
+          await delay(2500);
+          await throwIfServerOops(page, 'after local carrier click');
+        } else {
+          logStep('Landing', 'already on IAM — skip Bayan card');
+        }
+
+        logStep('Login', 'IAM progressive flow (identifier → password → OTP)');
+        const { baselineOtpMsgId } = await completeIamProgressiveLogin(page, {
+          IDENTITY_NUMBER,
+          PASSWORD,
+          OTP_SENDER,
         });
-        if (!clicked) {
-          await page.click('.column:first-child .card');
-        }
+        await throwIfServerOops(page, 'IAM before email OTP fetch');
 
-        await delay(2500);
-        await throwIfServerOops(page, 'after local carrier click');
-
-        logStep('Login form', 'waiting for #Username, #password');
-        await page.waitForSelector('#Username', { visible: true, timeout: 20000 });
-        await page.waitForSelector('#password', { visible: true, timeout: 20000 });
-        await throwIfServerOops(page, 'login page');
-
-        logStep('Login form', 'filling credentials and Policy=Email');
-        await page.type('#Username', IDENTITY_NUMBER, { delay: 80 });
-        await page.type('#password', PASSWORD, { delay: 80 });
-        await page.select('#Policy', 'Email');
-        await delay(300);
-
-        logStep('OTP baseline', 'getting latest message id before submit');
-        let baselineOtpMsgId = null;
-        try {
-          const { getLatestMessageMeta } = await import('./otpFetcher.js');
-          const meta = await getLatestMessageMeta(OTP_SENDER);
-          baselineOtpMsgId = meta?.id ?? null;
-          log('OTP baseline message id', baselineOtpMsgId ?? 'none');
-        } catch (e) {
-          log('OTP baseline fetch failed (will still try OTP)', e?.message);
-        }
-
-        logStep('Login', 'submit credentials');
-        await page.click('button[type="submit"][value="login"]');
-        logStep('OTP page', 'waiting for #TwoFactorCode1');
-        await page.waitForSelector('#TwoFactorCode1', { visible: true, timeout: 25000 });
-        await throwIfServerOops(page, 'otp page');
-
-        logStep('OTP', `waiting ${OTP_WAIT_MS}ms for email then fetching OTP`);
-        await delay(OTP_WAIT_MS);
-        const otp = await fetchOtpFromEmail(OTP_SENDER, 30, 2000, 0, baselineOtpMsgId);
+        const otp = await fetchOtpWithResendFallback(page, {
+          OTP_SENDER,
+          baselineOtpMsgId,
+          OTP_WAIT_MS,
+          OTP_RESEND_MAX,
+          OTP_RESEND_ENABLE_TIMEOUT_MS,
+          OTP_WAIT_AFTER_RESEND_MS,
+          OTP_FETCH_RETRIES,
+          OTP_FETCH_DELAY_MS,
+        });
         if (!otp) {
-          console.error('[Auth] OTP fetch returned empty');
+          console.error('[Auth] OTP fetch returned empty after waits and resend(s)');
           throw new Error('Failed to fetch OTP from email');
         }
         logStep('OTP', `received (length=${otp.length})`);
 
-        const otpDigits = otp.split('');
-        if (otpDigits.length < 4) {
-          console.error('[Auth] OTP too short:', otp?.length);
-          throw new Error(`OTP too short: ${otp}`);
-        }
-        logStep('OTP', 'typing digits into TwoFactorCode1-4');
-        for (let i = 0; i < 4; i++) {
-          const fieldId = `#TwoFactorCode${i + 1}`;
-          await page.click(fieldId);
-          await page.evaluate((id) => {
-            document.querySelector(id).value = '';
-          }, fieldId);
-          await page.type(fieldId, otpDigits[i], { delay: 40 });
-          await delay(150);
-        }
-        await delay(300);
+        await typeIamOtpAndVerify(page, otp);
 
-        logStep('OTP', 'waiting for verify button enabled, then submit');
-        await page.waitForFunction(
-          () => {
-            const btn = document.querySelector('button.verify-code');
-            return btn && !btn.disabled;
-          },
-          { timeout: 10000 }
-        );
-        await page.click('button.verify-code[type="submit"]');
-
-        logStep('Post-login', 'waiting for dashboard/session (up to 60s)');
-        const waitForPostLogin = async (timeoutMs = 60000) => {
+        const POST_LOGIN_TIMEOUT_MS = Number(process.env.POST_LOGIN_TIMEOUT_MS || 180000);
+        logStep('Post-login', `waiting for dashboard/session (up to ${POST_LOGIN_TIMEOUT_MS}ms)`);
+        const waitForPostLogin = async (timeoutMs = POST_LOGIN_TIMEOUT_MS) => {
           const start = Date.now();
+          let callbackSeenAt = 0;
+          let reloadCount = 0;
+          let gotoFallbackUsed = false;
+          const STUCK_RELOAD_MS = Number(process.env.OAUTH_CALLBACK_STUCK_MS || 3000);
+          const MAX_RELOADS = Number(process.env.OAUTH_CALLBACK_MAX_RELOADS || 6);
+          const RELOAD_TIMEOUT_MS = Number(process.env.OAUTH_CALLBACK_RELOAD_TIMEOUT_MS || 12000);
+          const GOTO_FALLBACK_AFTER = Number(process.env.OAUTH_CALLBACK_GOTO_AFTER || 3);
+          const isChromeErrorPage = async () => {
+            try {
+              const has = await page.$('#main-frame-error, #main-message');
+              return has != null;
+            } catch (_) {
+              return false;
+            }
+          };
+          const withTimeout = async (p, ms, label) => {
+            return Promise.race([
+              p,
+              new Promise((_, rej) => setTimeout(() => rej(new Error(`${label} timeout ${ms}ms`)), ms)),
+            ]);
+          };
+          let lastTick = 0;
           while (Date.now() - start < timeoutMs) {
-            await throwIfServerOops(page, 'post-login wait');
-            let url = '';
+            const elapsed = Date.now() - start;
+            if (elapsed - lastTick > 5000) {
+              lastTick = elapsed;
+              logStep('Post-login', `tick ${Math.round(elapsed / 1000)}s url=${(page.url() || '').slice(0, 120)}`);
+            }
+
+            await throwIfServerOops(page, 'post-login wait').catch(() => {});
+            let url = page.url();
+
             let cookies = [];
             try {
-              url = page.url();
-              cookies = await page.cookies();
-            } catch (e) {
-              await delay(750);
-              continue;
+              cookies = await withTimeout(page.cookies(), 3000, 'cookies');
+            } catch (_) {
+              cookies = [];
             }
             const names = new Set((cookies || []).map((c) => c?.name).filter(Boolean));
-            const hasDashboard = (await page.$('.sidebar-menu').catch(() => null)) != null;
+            const hasDashboard = await withTimeout(page.$('.sidebar-menu'), 2000, 'sidebar').catch(() => null);
             const hasSessionCookie = names.has('JSESSIONID') || names.has('TS01f96da1') || names.has('lang');
             const stillOnLogin = url.includes('/login') || (url.includes('#') && url.toLowerCase().includes('login'));
             if (hasDashboard || (hasSessionCookie && !stillOnLogin)) return;
+
+            const onOAuthCallback = /[?&]code=/.test(url) && /bayan\.logisti\.sa/.test(url);
+            const failed = pendingReloadReason !== null;
+            const errorPage = onOAuthCallback
+              ? await withTimeout(isChromeErrorPage(), 2000, 'errpage').catch(() => false)
+              : false;
+
+            if (onOAuthCallback || failed) {
+              if (!callbackSeenAt) callbackSeenAt = Date.now();
+              const stuckLongEnough = Date.now() - callbackSeenAt > STUCK_RELOAD_MS;
+              const shouldReload = (failed || errorPage || stuckLongEnough) && reloadCount < MAX_RELOADS;
+              if (shouldReload) {
+                reloadCount += 1;
+                const reason = failed
+                  ? `requestfailed=${pendingReloadReason}`
+                  : errorPage
+                  ? 'chrome error page'
+                  : 'stuck on OAuth callback';
+                pendingReloadReason = null;
+                if (reloadCount >= GOTO_FALLBACK_AFTER && !gotoFallbackUsed) {
+                  gotoFallbackUsed = true;
+                  logStep('Post-login', `${reloadCount} reloads failed (${reason}) — navigating to bayan root for fresh SSO`);
+                  await page
+                    .goto('https://bayan.logisti.sa/', { waitUntil: 'domcontentloaded', timeout: RELOAD_TIMEOUT_MS })
+                    .catch((e) => log('goto bayan root failed:', e?.message));
+                } else {
+                  logStep('Post-login', `${reason} ${reloadCount}/${MAX_RELOADS} — reloading`);
+                  await page
+                    .reload({ waitUntil: 'domcontentloaded', timeout: RELOAD_TIMEOUT_MS })
+                    .catch((e) => log('reload failed:', e?.message));
+                }
+                callbackSeenAt = 0;
+              }
+            } else {
+              callbackSeenAt = 0;
+            }
+
             await delay(750);
           }
           throw new Error('Post-login state not reached (still on login/OTP page)');
         };
-        await waitForPostLogin(60000);
+        await waitForPostLogin();
         logStep('Post-login', 'reached');
 
         await delay(1500);

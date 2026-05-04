@@ -6,7 +6,8 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "auth": "node server.js"
+    "auth": "node server.js",
+    "search:apple-email": "node searchAppleEmails.js"
   },
   "keywords": ["bayan", "logisti", "auth", "cookie", "token"],
   "license": "ISC",
