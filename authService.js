@@ -799,7 +799,7 @@ export async function getAuth(options = {}) {
 
       try {
         logStep('Navigate', 'bayan.logisti.sa');
-        await page.goto('https://logisti.sa/bayan/', { waitUntil: 'networkidle2', timeout: 30000 });
+        await page.goto('https://bayan.logisti.sa/', { waitUntil: 'networkidle2', timeout: 30000 });
         logStep('Page load', 'waiting for Bayan app-root or IAM login');
         await page.waitForFunction(
           () => document.querySelector('app-root') || document.querySelector('#Username'),
@@ -936,7 +936,7 @@ export async function getAuth(options = {}) {
                   gotoFallbackUsed = true;
                   logStep('Post-login', `${reloadCount} reloads failed (${reason}) — navigating to bayan root for fresh SSO`);
                   await page
-                    .goto('https://logisti.sa/bayan/', { waitUntil: 'domcontentloaded', timeout: RELOAD_TIMEOUT_MS })
+                    .goto('https://bayan.logisti.sa/', { waitUntil: 'domcontentloaded', timeout: RELOAD_TIMEOUT_MS })
                     .catch((e) => log('goto bayan root failed:', e?.message));
                 } else {
                   logStep('Post-login', `${reason} ${reloadCount}/${MAX_RELOADS} — reloading`);
@@ -1024,8 +1024,8 @@ export async function getAuth(options = {}) {
         const headers = {
           Cookie: cookieHeader,
           'User-Agent': userAgent || 'Mozilla/5.0',
-          Referer: 'https://logisti.sa/bayan/',
-          Origin: 'https://logisti.sa/bayan',
+          Referer: 'https://bayan.logisti.sa/',
+          Origin: 'https://bayan.logisti.sa',
         };
         if (accessToken) headers['Authorization'] = `Bearer ${accessToken}`;
 
