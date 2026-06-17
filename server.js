@@ -5,7 +5,7 @@ import { getAuth } from './authService.js';
 const log = (...args) => console.log('[Server]', ...args);
 
 const AUTH_REQUEST_TIMEOUT_MS = Number(process.env.AUTH_REQUEST_TIMEOUT_MS || 0) || 180000; // 3 min default
-const BAYAN_BASE_URL = (process.env.BAYAN_BASE_URL || 'https://bayan.logisti.sa').replace(/\/$/, '');
+const BAYAN_BASE_URL = (process.env.BAYAN_BASE_URL || 'https://logisti.sa/bayan').replace(/\/$/, '');
 const BAYAN_PROXY_TIMEOUT_MS = Number(process.env.BAYAN_PROXY_TIMEOUT_MS || 0) || 120000; // 2 min default
 
 const app = express();

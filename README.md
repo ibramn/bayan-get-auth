@@ -83,8 +83,8 @@ Performs login to Bayan, fetches OTP from email, then returns cookie and access 
   "headers": {
     "Cookie": "...",
     "User-Agent": "...",
-    "Referer": "https://bayan.logisti.sa/",
-    "Origin": "https://bayan.logisti.sa",
+    "Referer": "https://logisti.sa/bayan/",
+    "Origin": "https://logisti.sa/bayan",
     "Authorization": "Bearer eyJ..."
   }
 }
