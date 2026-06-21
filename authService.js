@@ -1,6 +1,7 @@
 import puppeteer from 'puppeteer-core';
 import { existsSync, mkdirSync } from 'fs';
 import { readFile, writeFile } from 'fs/promises';
+import { createHash, randomBytes } from 'node:crypto';
 import { fetchOtpFromEmail } from './otpFetcher.js';
 
 const log = (...args) => console.log('[Auth]', ...args);
@@ -115,6 +116,97 @@ async function isElementDisplayed(page, selector) {
     const style = window.getComputedStyle(el);
     return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
   }, selector);
+}
+
+/**
+ * Robustly trigger an IAM submit button.
+ *
+ * page.click(selector) throws "Node is either not clickable or not an Element" when the node it
+ * resolves has no clickable point — i.e. it is zero-sized, display:none or detached (NOT merely
+ * disabled; Puppeteer clicks disabled buttons fine). On these IAM forms that happens because
+ * (a) a hidden #fakeSubmitBtnExecuteOnEnter sits alongside the real submit to capture the Enter
+ * key, and (b) selecting the OTP-delivery Policy radio re-renders the form and can momentarily
+ * hide/replace the real submit button between typing and clicking.
+ *
+ * Strategy, in order: wait for a real (visible, sized, enabled) submit control, click it via an
+ * in-page DOM click (no geometry/occlusion check), then fall back to submitting the owning form,
+ * then to pressing Enter inside the form.
+ *
+ * @param {object} page Puppeteer page
+ * @param {{ id: string, phaseId?: string, anchorSelector?: string }} opts
+ * @returns {Promise<string>} how the submit was triggered ('dom-click' | 'form-submit' | 'enter-key')
+ */
+async function clickIamSubmit(page, { id, phaseId, anchorSelector }) {
+  await page
+    .waitForFunction(
+      (btnId, phId) => {
+        const usable = (el) => {
+          if (!el || el.disabled) return false;
+          const s = window.getComputedStyle(el);
+          if (s.display === 'none' || s.visibility === 'hidden') return false;
+          const r = el.getBoundingClientRect();
+          return r.width > 4 && r.height > 4;
+        };
+        if (Array.from(document.querySelectorAll('#' + btnId)).some(usable)) return true;
+        const scope = (phId && document.getElementById(phId)) || document;
+        return Array.from(scope.querySelectorAll('button[type="submit"], input[type="submit"]')).some(
+          (el) => el.id !== 'fakeSubmitBtnExecuteOnEnter' && usable(el)
+        );
+      },
+      { timeout: 20000 },
+      id,
+      phaseId || null
+    )
+    .catch(() => {});
+
+  const how = await page.evaluate(
+    (btnId, phId, anchorSel) => {
+      const usable = (el) => {
+        if (!el || el.disabled) return false;
+        const s = window.getComputedStyle(el);
+        if (s.display === 'none' || s.visibility === 'hidden') return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 4 && r.height > 4;
+      };
+      // Collect every candidate (handles duplicate ids and generic submit buttons in the phase),
+      // skip the hidden Enter-key proxy. Prefer a visible/sized one; otherwise DOM-click an
+      // existing-but-hidden #id anyway — el.click() fires its click handler AND the form's submit
+      // regardless of layout, which is exactly what page.click() refused to do.
+      const scope = (phId && document.getElementById(phId)) || document;
+      const candidates = [
+        ...document.querySelectorAll('#' + btnId),
+        ...scope.querySelectorAll('button[type="submit"], input[type="submit"]'),
+      ].filter((el) => el && el.id !== 'fakeSubmitBtnExecuteOnEnter');
+      const btn = candidates.find(usable) || candidates.find((el) => !el.disabled);
+      if (btn) {
+        btn.click();
+        return 'dom-click';
+      }
+      const anchor = anchorSel ? document.querySelector(anchorSel) : null;
+      const form =
+        (candidates[0] && candidates[0].form) ||
+        (anchor && anchor.form) ||
+        document.getElementById('formId');
+      if (form) {
+        if (typeof form.requestSubmit === 'function') form.requestSubmit();
+        else form.submit();
+        return 'form-submit';
+      }
+      return '';
+    },
+    id,
+    phaseId || null,
+    anchorSelector || null
+  );
+
+  if (how) return how;
+
+  if (anchorSelector) {
+    await page.focus(anchorSelector).catch(() => {});
+    await page.keyboard.press('Enter').catch(() => {});
+    return 'enter-key';
+  }
+  throw new Error(`No usable IAM submit button (#${id})`);
 }
 
 async function dismissRememberedAccountsIfPresent(page) {
@@ -240,7 +332,12 @@ async function completeIamProgressiveLogin(page, { IDENTITY_NUMBER, PASSWORD, OT
   }
 
   logStep('IAM', 'submit password');
-  await page.click('#passwordSubmitBtn');
+  const passwordSubmitHow = await clickIamSubmit(page, {
+    id: 'passwordSubmitBtn',
+    phaseId: 'phase-password',
+    anchorSelector: '#password',
+  });
+  logStep('IAM', `password submitted via ${passwordSubmitHow}`);
   await delay(800);
 
   logStep('IAM', 'wait for inline OTP (#phase-otp) or standalone /Account/VerifyOtp');
@@ -587,6 +684,115 @@ function getBrowserExecutablePath() {
   ]);
 }
 
+function base64Url(buf) {
+  return buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+/**
+ * Build a fresh OIDC authorize URL so we can land directly on IAM (iam.logisti.sa) for the
+ * credential + OTP step, skipping the flaky bayan.logisti.sa landing + "Local Carrier" card.
+ *
+ * The PKCE verifier here is NOT reused: the Bayan SPA does its own code→token exchange (with its
+ * own verifier) once an IAM SSO session exists — see triggerBayanSpaLogin(). We only need a valid
+ * S256 challenge so IAM renders the login page for the bayanClient.
+ */
+async function buildIamAuthorizeUrl() {
+  let authorizationEndpoint = 'https://iam.logisti.sa/connect/authorize';
+  try {
+    const raw = await readFile(process.env.OPENID_FILE || './openid.json', 'utf8');
+    const disc = JSON.parse(raw);
+    if (disc?.authorization_endpoint) authorizationEndpoint = disc.authorization_endpoint;
+  } catch (_) {
+    // fall back to the default endpoint
+  }
+
+  const clientId = process.env.BAYAN_CLIENT_ID || 'bayanClient';
+  const scope = process.env.BAYAN_AUTHORIZE_SCOPE || 'profile email roles openid';
+  const redirectUri = process.env.BAYAN_REDIRECT_URI || 'https://bayan.logisti.sa/#/login';
+  const uiLocales = process.env.BAYAN_UI_LOCALES || 'ar';
+
+  const codeVerifier = base64Url(randomBytes(32));
+  const codeChallenge = base64Url(createHash('sha256').update(codeVerifier).digest());
+  const state = base64Url(randomBytes(24));
+  const nonce = base64Url(randomBytes(24));
+
+  const params = new URLSearchParams({
+    response_type: 'code',
+    client_id: clientId,
+    state,
+    redirect_uri: redirectUri,
+    scope,
+    code_challenge: codeChallenge,
+    code_challenge_method: 'S256',
+    nonce,
+    ui_locales: uiLocales,
+  });
+  return `${authorizationEndpoint}?${params.toString()}`;
+}
+
+/**
+ * Drive the Bayan SPA to obtain the real session (cookies) + token. Call this AFTER a direct IAM
+ * login has established an IAM SSO session: the SPA initiates its own authorize request, IAM answers
+ * silently (no second OTP), and the SPA completes the exchange and sets the bayan.logisti.sa cookies
+ * that server.js's /bayan proxy forwards downstream.
+ */
+async function triggerBayanSpaLogin(page) {
+  logStep('Bayan SPA', 'navigate to bayan.logisti.sa for session (silent SSO)');
+  await page.goto('https://bayan.logisti.sa/', { waitUntil: 'networkidle2', timeout: 30000 });
+  await page.waitForFunction(
+    () =>
+      document.querySelector('app-root') ||
+      document.querySelector('#Username') ||
+      document.querySelector('.sidebar-menu'),
+    { timeout: 20000 }
+  );
+  await throwIfServerOops(page, 'bayan spa landing');
+
+  // Silent SSO may drop us straight on the dashboard — nothing to click.
+  if (await page.$('.sidebar-menu')) {
+    logStep('Bayan SPA', 'already on dashboard (silent SSO)');
+    return;
+  }
+
+  await delay(1500);
+  await page
+    .waitForFunction(
+      () =>
+        document.querySelector('.card') ||
+        document.querySelector('#Username') ||
+        document.querySelector('.sidebar-menu'),
+      { timeout: 20000 }
+    )
+    .catch(() => {});
+  await throwIfServerOops(page, 'bayan spa cards');
+
+  if (page.url().includes('iam.logisti.sa')) {
+    // IAM is prompting again (session not honored). Let the caller's post-login wait/retry handle it.
+    logStep('Bayan SPA', 'redirected back to IAM (SSO not honored) — leaving to post-login handler');
+    return;
+  }
+
+  logStep('Bayan SPA', 'click Local Carrier / first card to start authorize');
+  const clicked = await page.evaluate(() => {
+    const titles = Array.from(document.querySelectorAll('h4.card-title'));
+    const localCarrierTitle = titles.find((el) => el.textContent.trim() === 'Local Carrier');
+    if (localCarrierTitle) {
+      const card = localCarrierTitle.closest('.card');
+      if (card) {
+        card.click();
+        return true;
+      }
+    }
+    return false;
+  });
+  if (!clicked) {
+    const hasCard = await page.$('.column:first-child .card');
+    if (hasCard) await page.click('.column:first-child .card');
+  }
+  await delay(2500);
+  await throwIfServerOops(page, 'after local carrier click (spa)');
+}
+
 /**
  * Login to bayan.logisti.sa and return cookie and access token.
  * @returns {Promise<{ cookie: string, cookieHeader: string, accessToken: string | null, headers: object }>}
@@ -798,47 +1004,17 @@ export async function getAuth(options = {}) {
       });
 
       try {
-        logStep('Navigate', 'bayan.logisti.sa');
-        await page.goto('https://bayan.logisti.sa/', { waitUntil: 'networkidle2', timeout: 30000 });
-        logStep('Page load', 'waiting for Bayan app-root or IAM login');
+        // Go straight to IAM with a freshly built authorize request — skips the flaky
+        // bayan.logisti.sa landing + "Local Carrier" card for the credential/OTP step.
+        const authorizeUrl = await buildIamAuthorizeUrl();
+        logStep('Navigate', 'iam.logisti.sa (direct authorize)');
+        await page.goto(authorizeUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+        logStep('Page load', 'waiting for IAM login form (#Username) or remembered accounts');
         await page.waitForFunction(
-          () => document.querySelector('app-root') || document.querySelector('#Username'),
-          { timeout: 20000 }
+          () => document.querySelector('#Username') || document.querySelector('#phase-accounts'),
+          { timeout: 25000 }
         );
-        await throwIfServerOops(page, 'landing');
-
-        await delay(1500);
-        logStep('Landing', 'waiting for Bayan role cards or IAM #Username');
-        await page.waitForFunction(
-          () => document.querySelector('.card') || document.querySelector('#Username'),
-          { timeout: 20000 }
-        );
-        await throwIfServerOops(page, 'landing cards');
-
-        const urlAfterLoad = page.url();
-        if (!urlAfterLoad.includes('iam.logisti.sa')) {
-          logStep('Landing', 'click Local Carrier / first card');
-          const clicked = await page.evaluate(() => {
-            const titles = Array.from(document.querySelectorAll('h4.card-title'));
-            const localCarrierTitle = titles.find((el) => el.textContent.trim() === 'Local Carrier');
-            if (localCarrierTitle) {
-              const card = localCarrierTitle.closest('.card');
-              if (card) {
-                card.click();
-                return true;
-              }
-            }
-            return false;
-          });
-          if (!clicked) {
-            const hasCard = await page.$('.column:first-child .card');
-            if (hasCard) await page.click('.column:first-child .card');
-          }
-          await delay(2500);
-          await throwIfServerOops(page, 'after local carrier click');
-        } else {
-          logStep('Landing', 'already on IAM — skip Bayan card');
-        }
+        await throwIfServerOops(page, 'IAM direct landing');
 
         logStep('Login', 'IAM progressive flow (identifier → password → OTP)');
         const { baselineOtpMsgId } = await completeIamProgressiveLogin(page, {
@@ -865,6 +1041,20 @@ export async function getAuth(options = {}) {
         logStep('OTP', `received (length=${otp.length})`);
 
         await typeIamOtpAndVerify(page, otp);
+
+        // IAM now has an SSO session. The code from our direct-login authorize can't be consumed by
+        // the SPA (different PKCE verifier), so drive the SPA to run its OWN authorize: IAM answers
+        // silently (no second OTP) and the SPA establishes the bayan.logisti.sa session cookies that
+        // server.js's /bayan proxy forwards downstream.
+        logStep('Post-OTP', 'waiting for IAM to leave the login/OTP page (SSO session set)');
+        await page
+          .waitForFunction(
+            () => !/\/account\/(login|verifyotp)/i.test(window.location.pathname || ''),
+            { timeout: 30000 }
+          )
+          .catch(() => {});
+        await delay(1500);
+        await triggerBayanSpaLogin(page);
 
         const POST_LOGIN_TIMEOUT_MS = Number(process.env.POST_LOGIN_TIMEOUT_MS || 180000);
         logStep('Post-login', `waiting for dashboard/session (up to ${POST_LOGIN_TIMEOUT_MS}ms)`);
