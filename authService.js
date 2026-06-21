@@ -209,6 +209,121 @@ async function clickIamSubmit(page, { id, phaseId, anchorSelector }) {
   throw new Error(`No usable IAM submit button (#${id})`);
 }
 
+/**
+ * Best-effort dismissal of a blocking overlay — notably the logisti "راحتك تهمّنا" accessibility/
+ * onboarding tour modal that pops up over the IAM login form. Never throws.
+ *
+ * This is belt-and-suspenders: the real defense is that every interaction below uses DOM clicks /
+ * DOM property sets that fire *through* overlays. Dismissing the tour just keeps the page tidy and
+ * avoids it stealing focus. We only click controls *inside* a detected dialog/overlay container so
+ * we can never accidentally touch the login form itself.
+ *
+ * @returns {Promise<boolean>} true if something was clicked
+ */
+async function dismissOverlays(page) {
+  try {
+    const acted = await page.evaluate(() => {
+      const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+      const skipRe = /تخط[يّ]|تصف[حّ].*افتراض|إغلاق|\bskip\b|\bdismiss\b|\bclose\b/i;
+      const vis = (el) => {
+        const s = window.getComputedStyle(el);
+        if (s.display === 'none' || s.visibility === 'hidden') return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 40 && r.height > 40;
+      };
+      const containers = Array.from(
+        document.querySelectorAll(
+          '[role="dialog"],[aria-modal="true"],.modal,.tour,.intro,[class*="onboard" i],[class*="overlay" i]'
+        )
+      ).filter(vis);
+      let did = false;
+      for (const c of containers) {
+        const clickables = Array.from(
+          c.querySelectorAll('button, a, [role="button"], .close, [aria-label]')
+        );
+        const hit = clickables.find((el) => {
+          const t =
+            norm(el.textContent) + ' ' + norm(el.getAttribute('aria-label')) + ' ' + norm(el.className);
+          return skipRe.test(t);
+        });
+        if (hit) {
+          hit.click();
+          did = true;
+        }
+      }
+      return did;
+    });
+    if (acted) {
+      logStep('IAM', 'dismissed blocking overlay (tour/accessibility modal)');
+      await delay(400);
+    }
+    return acted;
+  } catch (_) {
+    return false;
+  }
+}
+
+/** Dump rich page state (buttons, OTP policies, dialogs, phase presence) + a screenshot for debugging. */
+async function dumpIamDiagnostics(page, where) {
+  try {
+    const shot = `bayan-iam-${where}-${Date.now()}.png`;
+    await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
+    const info = await page
+      .evaluate(() => {
+        const vis = (el) => {
+          if (!el) return false;
+          const s = window.getComputedStyle(el);
+          if (s.display === 'none' || s.visibility === 'hidden') return false;
+          const r = el.getBoundingClientRect();
+          return r.width > 0 && r.height > 0;
+        };
+        const ids = [
+          'Username', 'password', 'passwordSubmitBtn', 'continueBtn', 'otpSendBtn', 'TwoFactorCode1',
+          'phase-password', 'phase-otp', 'phase-methods', 'phase-passkey', 'otp-send-step',
+          'otp-verify-step', 'formId',
+        ];
+        const presence = {};
+        ids.forEach((id) => {
+          const el = document.getElementById(id);
+          presence[id] = el ? (vis(el) ? 'visible' : 'hidden') : 'absent';
+        });
+        const buttons = Array.from(document.querySelectorAll('button, input[type="submit"], a.btn'))
+          .slice(0, 40)
+          .map((b) => ({
+            id: b.id || null,
+            type: b.getAttribute('type'),
+            disabled: !!b.disabled,
+            vis: vis(b),
+            text: (b.textContent || b.value || '').replace(/\s+/g, ' ').trim().slice(0, 40),
+          }));
+        const policies = Array.from(document.querySelectorAll('input[name="Policy"]')).map((r) => ({
+          value: r.value,
+          checked: r.checked,
+          vis: vis(r),
+        }));
+        const dialogs = Array.from(
+          document.querySelectorAll('[role="dialog"],[aria-modal="true"],.modal')
+        ).map((d) => ({ vis: vis(d), text: (d.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 80) }));
+        const form = document.getElementById('formId');
+        return {
+          url: window.location.href,
+          path: window.location.pathname,
+          formAction: form ? form.getAttribute('action') : null,
+          presence,
+          policies,
+          dialogs,
+          buttons,
+          bodyText: (document.body?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 400),
+        };
+      })
+      .catch((err) => ({ evalError: err?.message }));
+    log(`IAM diagnostics [${where}]`, JSON.stringify(info));
+    log('IAM diagnostics screenshot', shot);
+  } catch (e) {
+    log('IAM diagnostics failed', e?.message);
+  }
+}
+
 async function dismissRememberedAccountsIfPresent(page) {
   const accountsPhase = '#phase-accounts';
   if (!(await isElementDisplayed(page, accountsPhase))) return;
@@ -228,7 +343,9 @@ async function completeIamProgressiveLogin(page, { IDENTITY_NUMBER, PASSWORD, OT
   await page.click('#Username', { clickCount: 3 }).catch(() => {});
   await page.type('#Username', IDENTITY_NUMBER, { delay: 80 });
   await delay(200);
-  await page.click('#continueBtn');
+  await dismissOverlays(page);
+  const continueHow = await clickIamSubmit(page, { id: 'continueBtn', anchorSelector: '#Username' });
+  logStep('IAM', `identifier submitted via ${continueHow}`);
   await delay(800);
 
   const pickPasswordFromMethods = () =>
@@ -313,12 +430,47 @@ async function completeIamProgressiveLogin(page, { IDENTITY_NUMBER, PASSWORD, OT
 
   logStep('IAM', 'password phase — #password, Policy Email, #passwordSubmitBtn');
   await throwIfServerOops(page, 'IAM password');
+  await dismissOverlays(page);
   await page.click('#password', { clickCount: 3 }).catch(() => {});
   await page.type('#password', PASSWORD, { delay: 80 });
-  const emailPolicy = await page.$('input[name="Policy"][value="Email"]');
-  if (emailPolicy) {
-    await emailPolicy.click().catch(() => {});
+
+  // Guard against an overlay/tour stealing focus mid-type — make sure the value actually landed.
+  const pwLanded = await page
+    .evaluate((len) => {
+      const el = document.getElementById('password');
+      return !!el && (el.value || '').length === len;
+    }, PASSWORD.length)
+    .catch(() => false);
+  if (!pwLanded) {
+    logStep('IAM', 'password value missing after type — set via DOM + input/change events');
+    await page.evaluate((val) => {
+      const el = document.getElementById('password');
+      if (!el) return;
+      el.focus();
+      el.value = val;
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    }, PASSWORD);
   }
+
+  // OTP-delivery policy radios are visually-hidden / custom-styled inputs (and a tour modal can sit
+  // on top), so a real Puppeteer click silently misses — leaving no delivery method selected, so no
+  // OTP is sent and the page never advances. Set it via the DOM and fire the events the UI listens for.
+  const policyResult = await page.evaluate(() => {
+    const radios = Array.from(document.querySelectorAll('input[name="Policy"]'));
+    if (!radios.length) return { found: false, total: 0 };
+    const email = radios.find((r) => (r.value || '').toLowerCase() === 'email') || null;
+    if (!email) return { found: false, total: radios.length, values: radios.map((r) => r.value) };
+    email.click(); // DOM click on a radio sets .checked and fires change, ignoring overlays/hiding
+    if (!email.checked) email.checked = true;
+    email.dispatchEvent(new Event('input', { bubbles: true }));
+    email.dispatchEvent(new Event('change', { bubbles: true }));
+    const label =
+      (email.id && document.querySelector(`label[for="${email.id}"]`)) || email.closest('label');
+    if (label) label.click();
+    return { found: true, checked: email.checked, value: email.value };
+  });
+  log('OTP delivery policy (Email)', JSON.stringify(policyResult));
   await delay(300);
 
   let baselineOtpMsgId = null;
@@ -341,6 +493,7 @@ async function completeIamProgressiveLogin(page, { IDENTITY_NUMBER, PASSWORD, OT
   await delay(800);
 
   logStep('IAM', 'wait for inline OTP (#phase-otp) or standalone /Account/VerifyOtp');
+  await dismissOverlays(page);
   await page.waitForFunction(
     () => {
       const path = (window.location.pathname || '').toLowerCase();
@@ -362,7 +515,10 @@ async function completeIamProgressiveLogin(page, { IDENTITY_NUMBER, PASSWORD, OT
       return sendOn || verifyOn;
     },
     { timeout: 45000 }
-  );
+  ).catch(async (otpWaitErr) => {
+    await dumpIamDiagnostics(page, 'otp-phase-timeout');
+    throw otpWaitErr;
+  });
   await throwIfServerOops(page, 'IAM OTP');
 
   const standaloneVerify = await page.evaluate(() => {
@@ -386,7 +542,16 @@ async function completeIamProgressiveLogin(page, { IDENTITY_NUMBER, PASSWORD, OT
     });
     if (sendStepVisible) {
       logStep('IAM', 'OTP send step — #otpSendBtn');
-      await page.click('#otpSendBtn');
+      await dismissOverlays(page);
+      const otpSent = await page.evaluate(() => {
+        const btn = document.getElementById('otpSendBtn');
+        if (btn && !btn.disabled) {
+          btn.click();
+          return true;
+        }
+        return false;
+      });
+      if (!otpSent) logStep('IAM', 'otpSendBtn missing/disabled — proceeding to wait for verify step');
       const afterSendMs = Number(process.env.OTP_AFTER_SEND_MS || 4000);
       await delay(Number.isFinite(afterSendMs) && afterSendMs >= 0 ? afterSendMs : 4000);
     }
