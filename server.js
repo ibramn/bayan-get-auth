@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
 import { getAuth } from './authService.js';
+import { getAuthHttp } from './authServiceHttp.js';
 
 const log = (...args) => console.log('[Server]', ...args);
 
@@ -76,6 +77,45 @@ app.all('/auth', async (req, res) => {
       code: error?.code ?? null,
       debugScreenshot: error?.debugScreenshot ?? null,
     });
+  }
+});
+
+/**
+ * GET or POST /auth/http
+ * Same response as /auth, but obtained via the browser-free OIDC code+PKCE HTTP flow
+ * (no Puppeteer/Chrome). Reuses the email OTP fetch.
+ */
+app.all('/auth/http', async (req, res) => {
+  log('/auth/http handler started');
+  let timedOut = false;
+  const timeoutId =
+    AUTH_REQUEST_TIMEOUT_MS > 0
+      ? setTimeout(() => {
+          timedOut = true;
+          if (!res.headersSent) {
+            res.status(504).json({ success: false, error: 'Auth request timed out', code: 'AUTH_TIMEOUT' });
+          }
+        }, AUTH_REQUEST_TIMEOUT_MS)
+      : null;
+
+  try {
+    if (timedOut) return;
+    const auth = await getAuthHttp();
+    if (timedOut || res.headersSent) return;
+    clearTimeout(timeoutId);
+    log('/auth/http success, returning cookie + token');
+    res.json({
+      success: true,
+      cookie: auth?.cookie ?? {},
+      cookieHeader: auth?.cookieHeader ?? '',
+      accessToken: auth?.accessToken ?? null,
+      headers: auth?.headers ?? {},
+    });
+  } catch (error) {
+    if (timedOut || res.headersSent) return;
+    clearTimeout(timeoutId);
+    console.error('[Server] /auth/http error:', error?.message, error?.code || '');
+    res.status(500).json({ success: false, error: error?.message ?? 'Unknown error', code: error?.code ?? null });
   }
 });
 
@@ -254,7 +294,7 @@ async function proxyToBayan(req, res) {
 
 const server = app.listen(PORT, () => {
   log('Listening', `http://localhost:${PORT}`);
-  log('Endpoints', `GET or POST ${PORT}/auth → cookie + accessToken`, 'GET /health → ok', `GET/POST ${PORT}/bayan/* → proxy to Bayan`);
+  log('Endpoints', `GET or POST ${PORT}/auth → cookie + accessToken (browser)`, `GET or POST ${PORT}/auth/http → same, browser-free (OIDC HTTP)`, 'GET /health → ok', `GET/POST ${PORT}/bayan/* → proxy to Bayan`);
   log('Auth timeout', `${AUTH_REQUEST_TIMEOUT_MS}ms`, 'Bayan base', BAYAN_BASE_URL);
 });
 
