@@ -7,7 +7,6 @@
   "scripts": {
     "start": "node server.js",
     "auth": "node server.js",
-    "runner": "node mqttRunner.js",
     "search:apple-email": "node searchAppleEmails.js"
   },
   "keywords": [
@@ -23,7 +22,6 @@
     "@microsoft/microsoft-graph-client": "^3.0.7",
     "dotenv": "^16.3.1",
     "express": "^4.21.0",
-    "mqtt": "^5.15.1",
     "puppeteer-core": "^24.35.0"
   }
 }
